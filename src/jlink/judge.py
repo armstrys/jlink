@@ -12,6 +12,7 @@ import math
 import warnings
 from numbers import Integral, Real
 from pathlib import Path
+from typing import Callable
 
 import numpy as np
 import pandas as pd
@@ -115,11 +116,19 @@ def judge(candidates: pd.DataFrame, left: pd.DataFrame, right: pd.DataFrame, *, 
     if exact_shortcut and any(f.left is None or f.right is None for f in fields):
         raise ValueError("`exact_shortcut` accepts pairs whose fields are all equal, so every `on` field "
                          "must exist on both sides; remove the one-sided fields or the shortcut")
-    check_columns(left, [c for _, c, _ in shown_left], "left")
-    check_columns(right, [c for _, c, _ in shown_right], "right")
+    # A field marked `judge=False` is one the caller knows everyone spells the same way. A pair
+    # equal on those fields, with every one of them present, needs no model: the caller said so.
+    # This is the per-field form of `exact_shortcut`, and the two may be used together.
+    deterministic_keys = any(f.judge is False for f in fields)
+    if deterministic_keys and any(f.judge is False and (f.left is None or f.right is None) for f in fields):
+        raise ValueError("a `judge=False` field is compared for equality, so it must exist on both "
+                         "sides; remove the one-sided field or stop marking it deterministic")
+    check_columns(left, [c for _, c, _, _ in shown_left], "left")
+    check_columns(right, [c for _, c, _, _ in shown_right], "right")
 
-    a = _records(left, ids(left, left_id, "left"), shown_left)
-    b = _records(right, ids(right, right_id, "right"), shown_right)
+    keys_from = _specs_key_selector(fields, exact_shortcut=exact_shortcut)
+    a = _records(left, ids(left, left_id, "left"), shown_left, keys_from)
+    b = _records(right, ids(right, right_id, "right"), shown_right, keys_from)
     for side, known, column in (("left", a, "left_id"), ("right", b, "right_id")):
         unknown = ~candidates[column].isin(known.index)
         if unknown.any():
@@ -133,7 +142,7 @@ def judge(candidates: pd.DataFrame, left: pd.DataFrame, right: pd.DataFrame, *, 
     models, providers, origins = (np.full(n, pd.NA, dtype=object) for _ in range(3))
     answered_at = np.full(n, np.nan)
 
-    if exact_shortcut and n:
+    if (exact_shortcut or deterministic_keys) and n:
         keys_a, keys_b = a["exact_key"].reindex(left_ids), b["exact_key"].reindex(right_ids)
         same = np.array([ka is not None and ka == kb for ka, kb in zip(keys_a, keys_b)], dtype=bool)
         p[same], source[same] = 1.0, "exact"
@@ -211,27 +220,43 @@ def judge(candidates: pd.DataFrame, left: pd.DataFrame, right: pd.DataFrame, *, 
     return scores, jev.meter
 
 
-def _side_specs(fields: list, side: str) -> list[tuple[str, str, object]]:
-    """[(label, column, normalizer), ...] for one side, keeping each field's own normalizer."""
+def _specs_key_selector(fields: list, *, exact_shortcut: bool):
+    """Which field specs contribute to ``exact_key``, or None for the default (all of them).
+
+    ``exact_shortcut`` wants a pair equal on every field, so it uses all of them. A field marked
+    ``judge=False`` settles on its own, so without the shortcut the key covers only those fields
+    -- otherwise a differing name would block a pair whose phone number is already conclusive.
+    """
+    if exact_shortcut or not any(f.judge is False for f in fields):
+        return None
+    return lambda specs: all(s[3] is False for s in specs)
+
+
+def _side_specs(fields: list, side: str) -> list[tuple[str, str, object, bool]]:
+    """[(label, column, normalizer, is_deterministic), ...] for one side."""
     out = []
     for field in fields:
         column = field.left if side == "left" else field.right
         if column is not None:
-            out.append((field.label, column, field.normalize))
+            out.append((field.label, column, field.normalize, field.judge))
     return out
 
 
-def _records(frame: pd.DataFrame, index: pd.Index, fields: list) -> pd.DataFrame:
+def _records(frame: pd.DataFrame, index: pd.Index, fields: list,
+             keys_from: Callable[[list], bool] | None = None) -> pd.DataFrame:
     """Per ID: the judge's record and a fieldwise key, absent if any field normalizes to empty.
 
-    ``fields`` is a list of ``(label, column, normalizer)`` triples, or the older
-    ``(label, column)`` pairs, which use the shared default normalizer.
+    ``fields`` is a list of ``(label, column, normalizer)`` or ``(label, column, normalizer,
+    judge)`` tuples, or the older ``(label, column)`` pairs, which use the shared default
+    normalizer. ``keys_from`` selects which specs contribute to ``exact_key``; by default all do.
+    A deterministic pair is one whose key is present and equal on both sides.
     """
-    specs = [(f[0], f[1], f[2] if len(f) > 2 else None) for f in fields]
-    columns = [c for _, c, _ in specs]
+    specs = [(f[0], f[1], f[2] if len(f) > 2 else None, f[3] if len(f) > 3 else True) for f in fields]
+    keyed = [s for s in specs if keys_from is None or keys_from([s])]
+    columns = [c for _, c, _, _ in specs]
     rows = frame[columns].to_dict("records")
-    record = [{label: v for (label, c, _) in specs if (v := clean(row[c])) is not None} for row in rows]
-    keys = [tuple((n or normalize)(clean(row[c])) for _, c, n in specs) for row in rows]
+    record = [{label: v for (label, c, _, _) in specs if (v := clean(row[c])) is not None} for row in rows]
+    keys = [tuple((n or normalize)(clean(row[c])) for _, c, n, _ in keyed) for row in rows]
     return pd.DataFrame({"record": record, "exact_key": [key if all(key) else None for key in keys]}, index=index)
 
 

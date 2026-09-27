@@ -165,3 +165,76 @@ def test_field_config_is_json_serializable_for_provenance():
     json.dumps(config)   # a callable must never reach settings.json
     assert config[1] == {"label": "phone", "left": "phone", "right": "phone",
                          "compare": "exact", "judge": False, "custom_normalizer": True}
+
+
+# ------------------------------------------- judge=False settles without exact_shortcut
+def _frames():
+    left = pd.DataFrame([{"left_id": k, "name": n, "phone": a} for k, n, a, _ in PEOPLE])
+    right = pd.DataFrame([{"right_id": k, "name": n, "phone": b} for k, n, _, b in PEOPLE])
+    return left, right
+
+
+def test_deterministic_field_settles_the_key_without_exact_shortcut(tables):
+    """judge=False is the per-field form of exact_shortcut, and works on its own."""
+    from jlink.judge import _records, _side_specs, _specs_key_selector
+    from jlink.fields import parse_fields
+    left, right = tables
+    fields = parse_fields([("name", "name"),
+                           Field("phone", "phone", "phone", normalize=main10, judge=False)],
+                          unpaired=True)
+    selector = _specs_key_selector(fields, exact_shortcut=False)
+    a = _records(left, pd.Index(left.left_id), _side_specs(fields, "left"), selector)
+    b = _records(right, pd.Index(right.right_id), _side_specs(fields, "right"), selector)
+    # the key covers only the deterministic field, so a differing name cannot block a match
+    assert a.loc["p1", "exact_key"] == b.loc["p1", "exact_key"] == ("5551234567",)
+    assert a.loc["p1", "exact_key"] != b.loc["p2", "exact_key"]
+
+
+def test_exact_shortcut_still_uses_every_field():
+    """With the shortcut on, the key is every field, as before."""
+    from jlink.judge import _records, _side_specs, _specs_key_selector
+    from jlink.fields import parse_fields
+    left, right = _frames()
+    fields = parse_fields([("name", "name"),
+                           Field("phone", "phone", "phone", normalize=main10, judge=False)],
+                          unpaired=True)
+    selector = _specs_key_selector(fields, exact_shortcut=True)
+    a = _records(left, pd.Index(left.left_id), _side_specs(fields, "left"), selector)
+    b = _records(right, pd.Index(right.right_id), _side_specs(fields, "right"), selector)
+    # the key now includes the name, and every pair matches on both fields
+    assert a.loc["p1", "exact_key"] == b.loc["p1", "exact_key"] == ("alice chen", "5551234567")
+    assert a.loc["p4", "exact_key"] == b.loc["p4", "exact_key"]
+    # ...but a name-inclusive key is stricter: a differing name would block a phone match
+    changed_right = right.copy()
+    changed_right.loc[changed_right.right_id == "p1", "name"] = "Someone Else"
+    b2 = _records(changed_right, pd.Index(changed_right.right_id), _side_specs(fields, "right"), selector)
+    assert a.loc["p1", "exact_key"] != b2.loc["p1", "exact_key"]
+
+
+def test_no_deterministic_field_leaves_key_selection_unchanged():
+    """Without the flag the selector is None, i.e. today's behaviour exactly."""
+    from jlink.judge import _specs_key_selector
+    from jlink.fields import parse_fields
+    assert _specs_key_selector(parse_fields([("name", "name")]), exact_shortcut=False) is None
+    assert _specs_key_selector(parse_fields([("name", "name")]), exact_shortcut=True) is None
+
+
+def test_deterministic_field_must_exist_on_both_sides():
+    from jlink.judge import judge
+    from jlink.fields import Field as F
+    left, right = _frames()
+    cands = pd.DataFrame([("p1", "p1")], columns=["left_id", "right_id"]).assign(sim=0.5)
+    with pytest.raises(ValueError, match="must exist on both sides"):
+        judge(cands, left, right,
+              on=[("name", "name"), F("phone", "phone", None, normalize=main10, judge=False)],
+              entity="person", left_id="left_id", right_id="right_id",
+              budget=0.0, cache=False, progress=False)
+
+
+def test_deterministic_field_is_inert_without_a_marked_field():
+    """A two-sided judge=False field always leaves both sides a field, so no pair is settled
+    unless the key is actually present and equal. The selector is what does the work."""
+    from jlink.judge import _specs_key_selector
+    from jlink.fields import parse_fields
+    fields = parse_fields([Field("phone", "phone", "phone", normalize=main10, judge=False)])
+    assert _specs_key_selector(fields, exact_shortcut=False) is not None
