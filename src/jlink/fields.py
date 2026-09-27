@@ -25,9 +25,10 @@ class Field:
 
     A plain column name or ``(left, right)`` pair is equivalent to a Field with defaults, so
     existing ``on`` arguments mean exactly what they meant before. Use a Field to say that a
-    column should be compared its own way -- for example a phone number compared by its digits:
+    column should be compared its own way -- for example a reference number compared by its digits,
+    with ``digits_only`` imported from :mod:`jlink`:
 
-        on=["name", Field("phone", normalize=digits10, compare="exact", judge=False)]
+        on=["name", Field("ref", "ref", "code", normalize=digits_only, compare="exact")]
 
     ``normalize`` replaces :func:`normalize` for this field everywhere the field is used: the
     blocking keys, the exact shortcut and the text shown to the judge. ``compare`` names the

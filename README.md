@@ -336,7 +336,7 @@ off is exactly today's behaviour, so a plain column name or `(left, right)` pair
 what it always meant:
 
 ```python
-from jlink import Field
+from jlink import Field, digits_only
 
 linker = jlink.Linker(
     entity="record",
