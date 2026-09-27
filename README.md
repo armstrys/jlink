@@ -324,6 +324,55 @@ again: the answer cache on your machine already makes pairs it answered free. It
 blocking is slow, when the cache is gone or was off, or when the candidate pairs must stay exactly
 those of the saved run.
 
+### Comparing a field its own way
+
+Every field is compared with the same text rule by default: case is folded, accents are
+stripped, punctuation is dropped. That is right for names and wrong for anything structured.
+Phone numbers are the clearest case. Written two ways, they are the same number and two
+different keys:
+
+```
+normalize("(555) 123-4567")  ->  "555 123 4567"
+normalize("5551234567")      ->  "5551234567"
+```
+
+A `Field` says how one `on` item is compared. There are three knobs, and leaving all of them
+off is exactly today's behaviour, so a plain column name or `(left, right)` pair still means
+what it always meant:
+
+```python
+from jlink.fields import Field, digits_only, phone_main
+
+linker = jlink.Linker(
+    entity="person",
+    on=["name",
+        Field("phone", "phone", "contact", normalize=phone_main, compare="exact"),
+        Field("ext", "ext", "ext", normalize=digits_only, compare="exact")],
+    blockers=[jlink.block.exact(Field("phone", "phone", "contact", normalize=phone_main)),
+              jlink.block.ngrams("name", k=10)],
+)
+```
+
+| knob | meaning |
+|---|---|
+| `normalize=` | a callable replacing the text rule for this field, used by the blocking keys, the exact shortcut and the group keys |
+| `compare=` | `text \| exact \| number \| date`, so default blocking can pick a sensible pass |
+| `judge=False` | the field is one everyone spells the same way, so an equal value on it may settle a pair without a model call |
+
+`judge=False` is the per-field form of `exact_shortcut=True`: it needs no global flag and works
+on its own. The key is then built from the marked fields only, so a differing name cannot block a
+pair whose phone number is already conclusive. A pair still needs every marked field present and
+equal, so a missing value settles nothing.
+
+On a set of eight people each written differently in two sources, the text rule reconciles **0 of
+8** pairs and a `phone_main` field reconciles **8 of 8**. End to end, a phone-only exact link over
+that data settles both links at **0 calls and $0.0000**, every link `source="exact"`.
+
+Beware the obvious workaround. Canonicalizing to the last ten digits *before* splitting off an
+extension produces wrong keys, not merely unmatched ones: `"555-123-4567 ext 2222"` becomes
+`"2345672222"`. `phone_main` drops the extension first and is offered as a named rule for this
+reason.
+
 ### Relations, not only identity
 
 By default the question put to Jev is "Record A and record B refer to the same firm", followed
@@ -459,6 +508,18 @@ regroups saved scores without API calls.
 `--on "=neighborhood"` are the one-sided fields (quote a leading `=`: zsh, the macOS default
 shell, otherwise reads `=word` as a command lookup and stops before jlink runs). Stata's
 `style(rule)` and R's `style = "rule"` forward the same option.
+
+A field's own rule is reachable from the command line too, with `--normalize COL=RULE`,
+`--compare COL=KIND` and `--deterministic COL`, where `RULE` is one of `normalize`, `digits`,
+`phone` or `extension`, and `KIND` is `text`, `exact`, `number` or `date`. The flags name a
+column, so they compose with every `--on` form, including `left=right` and the one-sided ones;
+naming a column `--on` does not use is an error rather than a silent no-op.
+
+```bash
+jlink link people.csv registry.csv --on name=name --on phone \
+      --normalize phone=phone --compare phone=exact --deterministic phone \
+      --entity person --left-id person_id --right-id reg_id -o links.csv
+```
 `--block window:published=occurred:0..3d` is the date window above, `--block window:year:1` a
 numeric one, and `--block within:borough:RULE` runs any rule inside groups; `--date-format`
 reads dates that are not ISO 8601.
@@ -487,6 +548,10 @@ links <- jlink(compustat, patents, on = c("conm=assignee", "state"), entity = "f
 - These are a model's judgments. Audit a sample before you rely on the links.
 - Jev can only judge pairs that blocking proposes. If the names share nothing, add a pass that
   brings the pair together some other way (`exact` on state, year or industry).
+- A field compared its own way is compared **only** that way. `Field(..., compare="exact")` with a
+  custom normalizer settles on exact equality of the normalized value, so a typo in a phone
+  number will not match, and `normalize=phone_main` keeps the last ten digits, which merges a
+  number written with and without its country code.
 - Jev reads the fields you give it and nothing else. It does not look anything up, and what it
   knows about firms stops at its training data.
 - Repeated calls return nearly but not exactly the same probability (within 0.03 in our tests).
