@@ -5,45 +5,108 @@ from __future__ import annotations
 import math
 import re
 import unicodedata
+from dataclasses import dataclass
+from typing import Callable
 
 import numpy as np
 import pandas as pd
 
-On = list  # items are "column" or ("left_column", "right_column")
+On = list  # items are "column", ("left_column", "right_column"), or a Field
 _PUNCT = re.compile(r"[^\w\s]|_")
 _SPACE = re.compile(r"\s+")
 _WHOLE_DECIMAL = re.compile(r"[+-]?\d+\.0+")
 
+COMPARES = ("text", "exact", "number", "date")
 
-def parse_on(on, *, unpaired: bool = False) -> list[tuple[str, str | None, str | None]]:
-    """[(label, left_column, right_column), ...]. The label is the left column name.
 
-    With ``unpaired=True`` an item may also be ``(left, None)`` or ``(None, right)``: a field that
-    only one side has. It is shown to the judge under its own column name; the absent side is None.
-    Steps that compare a left column with a right column keep the default and reject such items.
+@dataclass(frozen=True)
+class Field:
+    """One ``on`` item, with its own normalization, comparison rule and judging policy.
+
+    A plain column name or ``(left, right)`` pair is equivalent to a Field with defaults, so
+    existing ``on`` arguments mean exactly what they meant before. Use a Field to say that a
+    column should be compared its own way -- for example a phone number compared by its digits:
+
+        on=["name", Field("phone", normalize=digits10, compare="exact", judge=False)]
+
+    ``normalize`` replaces :func:`normalize` for this field everywhere the field is used: the
+    blocking keys, the exact shortcut and the text shown to the judge. ``compare`` names the
+    kind of comparison so default blocking can pick sensible passes. ``judge=False`` marks a
+    field as deterministic: a pair may be settled from it without asking the model.
     """
-    if isinstance(on, str):
+
+    label: str
+    left: str | None
+    right: str | None
+    normalize: Callable[[object], str] | None = None
+    compare: str = "text"
+    judge: bool = True
+
+    @property
+    def triple(self) -> tuple[str, str | None, str | None]:
+        """The ``(label, left, right)`` view used by code that predates Field."""
+        return (self.label, self.left, self.right)
+
+    def normalizer(self) -> Callable[[object], str]:
+        """This field's normalizer, falling back to the shared :func:`normalize`."""
+        return self.normalize or normalize
+
+    def to_config(self) -> dict:
+        """JSON-safe description; a callable normalizer is recorded, not stored."""
+        return {"label": self.label, "left": self.left, "right": self.right,
+                "compare": self.compare, "judge": bool(self.judge),
+                "custom_normalizer": self.normalize is not None}
+
+
+
+def parse_fields(on, *, unpaired: bool = False) -> list[Field]:
+    """Every ``on`` item as a :class:`Field`.
+
+    Accepts a column name, a ``(left, right)`` pair, a one-sided ``(left, None)`` or
+    ``(None, right)``, or a Field, in any mixture. ``parse_on`` is the tuple view of this.
+    """
+    if isinstance(on, (str, Field)):
         on = [on]
     if not on:
         raise ValueError("`on` must name at least one field to compare")
-    out = []
+    out: list[Field] = []
     for item in on:
-        pair = tuple(item) if isinstance(item, (tuple, list)) and len(item) == 2 else ()
-        if isinstance(item, str):
-            out.append((item, item, item))
-        elif pair and all(isinstance(c, str) for c in pair):
-            out.append((pair[0], pair[0], pair[1]))
-        elif pair and sum(c is None for c in pair) == 1 and any(isinstance(c, str) for c in pair):
-            if not unpaired:
-                raise ValueError(f"the field {pair!r} exists on one side only, but this step compares a left "
-                                 "column with a right column; one-sided fields are only shown to the judge")
-            out.append((pair[0] or pair[1], pair[0], pair[1]))
+        if isinstance(item, Field):
+            field = item
+            if not isinstance(field.label, str) or not field.label:
+                raise ValueError(f"a Field's label must be a nonempty column name; got {field.label!r}")
+            if field.normalize is not None and not callable(field.normalize):
+                raise ValueError(f"field {field.label!r}: `normalize` must be callable")
+            if field.compare not in COMPARES:
+                raise ValueError(f"field {field.label!r}: `compare` must be one of "
+                                 f"{', '.join(COMPARES)}; got {field.compare!r}")
+            if not isinstance(field.judge, bool):
+                raise ValueError(f"field {field.label!r}: `judge` must be a boolean")
+            if (field.left is None) == (field.right is None):
+                raise ValueError(f"field {field.label!r}: exactly one of `left`/`right` may be None")
+            if field.left is None or field.right is None:
+                if not unpaired:
+                    raise ValueError(f"the field {(field.left, field.right)!r} exists on one side only, "
+                                     "but this step compares a left column with a right column; "
+                                     "one-sided fields are only shown to the judge")
+            out.append(field)
         else:
-            raise ValueError("each `on` item is a column name, a (left, right) pair of names, or a one-sided "
-                             f"(left, None) or (None, right); got {item!r}")
-    if any(lc is None or rc is None for _, lc, rc in out):
-        for side, labels in (("left", [f[0] for f in out if f[1] is not None]),
-                             ("right", [f[0] for f in out if f[2] is not None])):
+            pair = tuple(item) if isinstance(item, (tuple, list)) and len(item) == 2 else ()
+            if isinstance(item, str):
+                out.append(Field(item, item, item))
+            elif pair and all(isinstance(c, str) for c in pair):
+                out.append(Field(pair[0], pair[0], pair[1]))
+            elif pair and sum(c is None for c in pair) == 1 and any(isinstance(c, str) for c in pair):
+                if not unpaired:
+                    raise ValueError(f"the field {pair!r} exists on one side only, but this step compares a left "
+                                     "column with a right column; one-sided fields are only shown to the judge")
+                out.append(Field(pair[0] or pair[1], pair[0], pair[1]))
+            else:
+                raise ValueError("each `on` item is a column name, a (left, right) pair of names, or a one-sided "
+                                 f"(left, None) or (None, right); got {item!r}")
+    if any(f.left is None or f.right is None for f in out):
+        for side, labels in (("left", [f.label for f in out if f.left is not None]),
+                             ("right", [f.label for f in out if f.right is not None])):
             if not labels:
                 raise ValueError(f"`on` gives the {side} records no field; "
                                  "the judge needs at least one per side")
@@ -54,10 +117,29 @@ def parse_on(on, *, unpaired: bool = False) -> list[tuple[str, str | None, str |
     return out
 
 
+def parse_on(on, *, unpaired: bool = False) -> list[tuple[str, str | None, str | None]]:
+    """[(label, left_column, right_column), ...]. The label is the left column name.
+
+    With ``unpaired=True`` an item may also be ``(left, None)`` or ``(None, right)``: a field that
+    only one side has. It is shown to the judge under its own column name; the absent side is None.
+    Steps that compare a left column with a right column keep the default and reject such items.
+    """
+    return [field.triple for field in parse_fields(on, unpaired=unpaired)]
+
+
 def side_fields(fields: list, side: str) -> list[tuple[str, str]]:
-    """[(label, column), ...] for the fields that the left or the right records have."""
+    """[(label, column), ...] for the fields that the left or the right records have.
+
+    Accepts :class:`Field` objects or the older ``(label, left, right)`` triples.
+    """
     index = 1 if side == "left" else 2
-    return [(f[0], f[index]) for f in fields if f[index] is not None]
+    out = []
+    for field in fields:
+        label, column = (field.label, field.left if index == 1 else field.right) \
+            if isinstance(field, Field) else (field[0], field[index])
+        if column is not None:
+            out.append((label, column))
+    return out
 
 
 def check_columns(frame: pd.DataFrame, columns: list[str], side: str) -> None:
@@ -91,19 +173,22 @@ def clean(value):
     return text or None
 
 
-def key_text(value: object) -> str:
+def key_text(value: object, normalizer: Callable[[object], str] | None = None) -> str:
     """Normalized text of one exact or group key component; empty if missing.
 
     Whole numbers agree however they are stored. A numeric column with one missing value is
     float in pandas, and a table written from it says "1985.0", so the integer 1985, the float
     1985.0 and the texts "1985" and "1985.0" all give "1985".
+
+    ``normalizer`` lets a field supply its own normalization, for example digits-only for a
+    phone number. It defaults to :func:`normalize`.
     """
     value = clean(value)
     if isinstance(value, float) and value.is_integer():
         value = int(value)  # clean() leaves whole floats from 1e15 up as floats; sixteen-digit keys exist
     elif isinstance(value, str) and _WHOLE_DECIMAL.fullmatch(value):
         value = value[:value.index(".")]
-    return normalize(value)
+    return (normalizer or normalize)(value)
 
 
 def record_text(frame: pd.DataFrame, columns: list[str]) -> pd.Series:
