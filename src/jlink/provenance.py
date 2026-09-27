@@ -12,7 +12,7 @@ import numpy as np
 import pandas as pd
 
 from .block import Blocker
-from .fields import ids
+from .fields import Field, ids
 
 
 def blocker_config(blocker: Blocker) -> dict:
@@ -102,11 +102,20 @@ def frame_fingerprint(frame: pd.DataFrame, *, id_column: str | None, columns: li
             "rows": len(frame), "columns": columns, "id_column": id_column, "row_order_matters": True}
 
 
+def _field_column(field, side: int):
+    """A field's left (1) or right (2) column, from a :class:`Field` or an older triple."""
+    if isinstance(field, Field):
+        return field.left if side == 1 else field.right
+    return field[side]
+
+
 def input_fingerprints(left, right, *, fields, left_id, right_id) -> dict:
     result = {}
     for side, frame, id_column, columns in (
-        ("left", left, left_id, [lc for _, lc, _ in fields if lc is not None]),
-        ("right", right, right_id, [rc for _, _, rc in fields if rc is not None]),
+        ("left", left, left_id,
+         [_field_column(f, 1) for f in fields if _field_column(f, 1) is not None]),
+        ("right", right, right_id,
+         [_field_column(f, 2) for f in fields if _field_column(f, 2) is not None]),
     ):
         result[side] = {
             "compared": frame_fingerprint(frame, id_column=id_column, columns=columns, side=side),

@@ -359,6 +359,60 @@ mix. One-sided fields are shown to the judge only; a blocking pass needs a colum
 and says so if given one. See [relation linking](https://github.com/keltokhy/jlink/blob/main/docs/relation-linking.md) and
 [windows on dates and numbers](https://github.com/keltokhy/jlink/blob/main/docs/blocking.md#windows-on-dates-and-numbers).
 
+### Field types: keys that follow the value
+
+By default every `on` field is compared as prose. A postcode, a date and a price are not prose,
+and keying them as text splits or merges records wrongly. Give a field a **type** and its type
+supplies two things: a canonicalizer, which turns a value into the key used for exact matching,
+and a default blocking pass.
+
+| `compare=` | canonical key | default pass | use for |
+| --- | --- | --- | --- |
+| `text` (default) | `normalize` | n-grams, both directions | names, addresses, any prose |
+| `exact` | `normalize` | exact key | text that must match exactly, not fuzzily |
+| `digits` | digit characters only, int-only, zeros kept | exact key | postcode, ID, VAT, EAN |
+| `date` | ISO 8601 as `YYYY`, `YYYY-MM` or `YYYY-MM-DD` | exact key | dates and years |
+
+```python
+from jlink import Linker
+from jlink.fields import Field
+
+result = Linker(entity="person", on=[
+    "name",
+    Field("postcode", "zip", "postal_code", compare="digits"),
+    Field("born", "date_of_birth", "dob", compare="date"),
+    Field("price", "price", "cost", key=False),        # shown to the judge, never keyed
+    ]).link(left, right)
+```
+
+Whole-number presentation is reconciled before the type rule runs, so a numeric column read as
+`200.0` gives the digits `"200"`, not `"2000"`, and `"1985.0"` is the year `1985`. Leading zeros
+are kept: `"0200"` stays distinct from `"200"`. Two rules hold everywhere:
+
+- **Drop, never guess.** A value the type cannot read unambiguously is dropped (its key is empty,
+  so it never pairs) and counted, matching the window pass's policy. `03/01/2024` is ambiguous
+  without a convention, so `date` leaves it unmatched; so is `20.5` under `digits`, which is not a
+  whole number and is dropped rather than flattened to `205`. A wrong key silently merges distinct
+  records, which is worse than no match.
+- **No locale or format guessing.** `date` reads ISO-shaped year-first dates only (`2024-03-01`,
+  `2024/03/01`, `2024-03`), plus a bare year. A locale-specific format needs your own canonicalizer.
+
+A `key=False` field is **judge-only**: it is shown to the judge in both records but stays out of
+keys, `sim` and the exact shortcut, so a price or a note informs the decision without spending a
+blocking pass or settling a pair. A `deterministic=True` field on a typed `compare` settles an
+equal, present key with no model call (recorded as `source="exact"`); use it only when that key
+establishes identity in your data.
+
+To compare a type's values your own way, pass a callable: `Field("ref", "ref", "code",
+normalize=my_rule)`. It replaces the canonicalizer everywhere the field is used, and a saved run
+records it as `"custom"` without storing code. The named types are the defaults; the protocol and
+[the phone example](https://github.com/keltokhy/jlink/blob/main/docs/field-types.md) show what a custom rule looks like, including a
+truncation trap to avoid. On the command line, name a type with `--type COL=KIND`:
+
+```
+jev-link link people.dta registry.dta --on name --on zip=postal_code --type zip=digits --entity person
+```
+
 ### Dedupe: one table against itself
 
 ```python
@@ -461,7 +515,10 @@ shell, otherwise reads `=word` as a command lookup and stops before jlink runs).
 `style(rule)` and R's `style = "rule"` forward the same option.
 `--block window:published=occurred:0..3d` is the date window above, `--block window:year:1` a
 numeric one, and `--block within:borough:RULE` runs any rule inside groups; `--date-format`
-reads dates that are not ISO 8601.
+reads dates that are not ISO 8601. `--type COL=KIND` (KIND is `text`, `exact`, `digits` or
+`date`) types an `--on` or `--block` column, so its keys and default pass follow the kind; an
+unknown kind or a column neither flag uses is an error, and the same flag works for `link` and
+`dedupe`.
 
 The Stata and R wrappers are single files in this repository, not part of the Python package: copy
 `stata/jlink.ado` and `stata/jlink.sthlp` to your personal ado directory (`sysdir` shows it), and

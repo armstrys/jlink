@@ -15,7 +15,7 @@ from jevkit_runtime.cli import parse_budget
 
 from . import __version__
 from .core import PROVIDERS
-from .fields import check_columns, ids, parse_on
+from .fields import COMPARES, Field, check_columns, ids, parse_fields, parse_on
 from .io import FORMATS, read_table, stata_value_labels, write_table
 
 _BLOCK_FORMS = ("ngrams:name:10, ngrams-reverse:name:10, embeddings:name:10, ngrams:name+city:20, exact:state, initials:name, "
@@ -120,6 +120,12 @@ def _add_fields(parser: argparse.ArgumentParser, *, required: bool = True) -> No
                         help="field to compare; repeat for more fields (city=town uses different names; "
                              "text= shows a field only the left records have, \"=place\" only the right; "
                              "quote a leading = because zsh expands it)")
+    parser.add_argument("--type", action="append", default=[], metavar="COL=KIND",
+                        help="say what kind of value an --on or --block column holds, so default "
+                             "blocking and keys follow the kind; repeat as needed. Kinds: "
+                             + ", ".join(COMPARES) + ". text (default) searches by similarity; exact "
+                             "matches equal text; digits keeps only the digits of a whole number; date "
+                             "reads ISO 8601 and drops anything ambiguous")
     parser.add_argument("--left-id", metavar="COL",
                         help="unique left record ID; default: zero-based row number")
     parser.add_argument("--right-id", metavar="COL",
@@ -259,6 +265,9 @@ def _parser() -> argparse.ArgumentParser:
     dedupe.add_argument("table", metavar="TABLE", help=".csv, .tsv, .dta or .parquet file to deduplicate")
     dedupe.add_argument("--on", action="append", required=True, metavar="COL",
                         help="field to compare; repeat for more fields")
+    dedupe.add_argument("--type", action="append", default=[], metavar="COL=KIND",
+                        help="say what kind of value an --on or --block column holds; kinds: "
+                             + ", ".join(COMPARES))
     dedupe.add_argument("--id", metavar="COL", help="unique record ID; default: zero-based row number")
     _add_blocking(dedupe, "Default: 11 nearest text matches across all --on fields, because a record is "
                           "its own nearest match")
@@ -334,8 +343,9 @@ def _parser() -> argparse.ArgumentParser:
     return parser
 
 
-def _fields(args: argparse.Namespace, left: pd.DataFrame, right: pd.DataFrame) -> list:
-    on = [_column(item, unpaired=True) for item in args.on]
+def _fields(args: argparse.Namespace, left: pd.DataFrame, right: pd.DataFrame,
+            extra: set | None = None) -> list:
+    on = _typed(_column_items(args.on, unpaired=True), _types(args), extra or set())
     for _, a, b in parse_on(on, unpaired=True):
         check_columns(left, [a] if a is not None else [], args.left)
         check_columns(right, [b] if b is not None else [], args.right)
@@ -344,22 +354,95 @@ def _fields(args: argparse.Namespace, left: pd.DataFrame, right: pd.DataFrame) -
     return on
 
 
+def _column_items(values: list, *, unpaired: bool = False) -> list:
+    return [_column(value, unpaired=unpaired) for value in values]
+
+
+def _column_settings(values: list, *, label: str, pattern: str) -> dict:
+    """Parse repeated COLUMN=VALUE flags, rejecting a missing or contradictory assignment."""
+    out: dict[str, str] = {}
+    for item in values:
+        if item.count("=") != 1:
+            raise ValueError(f"{label} must be COLUMN={pattern}; got {item!r}")
+        column, value = (part.strip() for part in item.split("="))
+        if not column or not value:
+            raise ValueError(f"{label} must be COLUMN={pattern}; got {item!r}")
+        if column in out and out[column] != value:
+            raise ValueError(f"{label} names column {column!r} twice with different values")
+        out[column] = value
+    return out
+
+
+def _types(args: argparse.Namespace) -> dict:
+    return _column_settings(getattr(args, "type", []), label="--type", pattern="KIND")
+
+
+def _item_columns(items: list) -> set:
+    """Every column name a list of --on/--block items mentions."""
+    return {c for spec in parse_fields(items, unpaired=True)
+            for c in (spec.label, spec.left, spec.right) if isinstance(c, str)}
+
+
+def _typed(items: list, types: dict, used: set) -> list:
+    """Apply --type to whichever items carry those columns, leaving everything else untouched.
+
+    A column named by --type must be used by --on or --block, and a kind must be a named type: an
+    unknown kind or unused column is an error, not a silent no-op. An item whose kind already matches
+    -- or that no --type names -- stays a plain name or pair, so a config over plain columns is
+    byte-identical to one that never saw --type.
+    """
+    for kind in types.values():
+        if kind not in COMPARES:
+            raise ValueError(f"--type {kind!r} is not a known kind; choose from {', '.join(COMPARES)}")
+    if not types:
+        return items
+    specs = parse_fields(items, unpaired=True)
+    if missing := set(types) - _item_columns(items) - used:
+        raise ValueError(f"--type names a column that --on or --block does not use: "
+                         f"{', '.join(sorted(missing))}")
+    out = []
+    for item, spec in zip(items, specs):
+        columns = (spec.label, spec.left, spec.right)
+        kind = next((types[c] for c in columns if c in types), spec.compare)
+        if kind == spec.compare:
+            out.append(item)
+        else:
+            out.append(Field(spec.label, spec.left, spec.right, compare=kind))
+    return out
+
+
 def _inputs(args: argparse.Namespace) -> tuple[pd.DataFrame, pd.DataFrame, list, list | None]:
     # Parse rules before importing the independently developed blocking module.
     specs = [_block_spec(rule) for rule in args.block or []]
     left, right = read_table(args.left), read_table(args.right)
-    on = _fields(args, left, right)
-    return left, right, on, _blockers(args, specs, left, right, args.left, args.right)
+    on = _fields(args, left, right, extra=_block_column_names(specs))
+    return left, right, on, _blockers(args, specs, left, right, args.left, args.right,
+                                      used=_item_columns(on))
+
+
+def _block_column_names(specs: list) -> set:
+    """Every column named by a --block rule, including a nested within rule's child."""
+    names = set()
+    for _, columns, options in specs:
+        names |= _item_columns(columns)
+        if options.get("child"):
+            names |= _block_column_names([options["child"]])
+    return names
 
 
 def _blockers(args: argparse.Namespace, specs: list, left: pd.DataFrame, right: pd.DataFrame,
-              left_name: str, right_name: str) -> list | None:
+              left_name: str, right_name: str, *, used: set | None = None) -> list | None:
     blockers = None
     if specs:
         from . import block
 
+        types, named = _types(args), (used or set()) | _block_column_names(specs)
+
         def build(spec):
             kind, columns, options = spec
+            # --type applies to a pass's columns too, so `--block exact:postcode --type postcode=digits`
+            # keys the pass by its digits rather than the shared text rule.
+            columns = _typed(columns, types, named)
             for _, a, b in parse_on(columns):
                 check_columns(left, [a], left_name)
                 check_columns(right, [b], right_name)
@@ -533,11 +616,11 @@ def _dedupe(args: argparse.Namespace) -> None:
         _question(args)
     specs = [_block_spec(rule) for rule in args.block or []]
     frame = read_table(args.table)
-    on = [_column(item) for item in args.on]
+    on = _typed(_column_items(args.on), _types(args), _block_column_names(specs))
     for _, a, b in parse_on(on):
         check_columns(frame, [a, b], args.table)
     ids(frame, args.id, args.table)
-    blockers = _blockers(args, specs, frame, frame, args.table, args.table)
+    blockers = _blockers(args, specs, frame, frame, args.table, args.table, used=_item_columns(on))
     if args.estimate:
         from .block import self_candidates
 
