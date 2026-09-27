@@ -15,7 +15,7 @@ from jevkit_runtime.cli import parse_budget
 
 from . import __version__
 from .core import PROVIDERS
-from .fields import check_columns, ids, parse_on
+from .fields import NORMALIZERS, Field, check_columns, ids, parse_on
 from .io import FORMATS, read_table, stata_value_labels, write_table
 
 _BLOCK_FORMS = ("ngrams:name:10, ngrams-reverse:name:10, embeddings:name:10, ngrams:name+city:20, exact:state, initials:name, "
@@ -120,10 +120,36 @@ def _add_fields(parser: argparse.ArgumentParser, *, required: bool = True) -> No
                         help="field to compare; repeat for more fields (city=town uses different names; "
                              "text= shows a field only the left records have, \"=place\" only the right; "
                              "quote a leading = because zsh expands it)")
+    parser.add_argument("--normalize", action="append", default=[], metavar="COL=RULE",
+                        help="compare a column its own way instead of the shared text rule; repeat as "
+                             "needed. Rules: " + ", ".join(sorted(NORMALIZERS)) +
+                             " (digits keeps only digits; phone drops a trailing extension and keeps "
+                             "the last ten digits; extension keeps just the extension digits)")
+    parser.add_argument("--compare", action="append", default=[], metavar="COL=KIND",
+                        help="say what kind of field a column is, so default blocking can suit it: "
+                             "text (default), exact, number or date; repeat as needed")
+    parser.add_argument("--deterministic", action="append", default=[], metavar="COL",
+                        help="mark a column as a name everyone spells the same way, so an exact rule "
+                             "on it may be trusted without asking the model; repeat as needed")
     parser.add_argument("--left-id", metavar="COL",
                         help="unique left record ID; default: zero-based row number")
     parser.add_argument("--right-id", metavar="COL",
                         help="unique right record ID; default: zero-based row number")
+
+
+def _column_settings(values: list, *, label: str, pattern: str) -> dict:
+    """Parse repeated COL=VALUE flags into {column: value}, rejecting a missing or repeated assignment."""
+    out: dict[str, str] = {}
+    for item in values:
+        if item.count("=") != 1:
+            raise ValueError(f"{label} must be COLUMN={pattern}; got {item!r}")
+        column, value = item.split("=")
+        if not column.strip() or not value.strip():
+            raise ValueError(f"{label} must be COLUMN={pattern}; got {item!r}")
+        if column in out and out[column] != value:
+            raise ValueError(f"{label} names column {column!r} twice with different values")
+        out[column.strip()] = value.strip()
+    return out
 
 
 def _add_question(parser: argparse.ArgumentParser) -> None:
@@ -259,6 +285,14 @@ def _parser() -> argparse.ArgumentParser:
     dedupe.add_argument("table", metavar="TABLE", help=".csv, .tsv, .dta or .parquet file to deduplicate")
     dedupe.add_argument("--on", action="append", required=True, metavar="COL",
                         help="field to compare; repeat for more fields")
+    dedupe.add_argument("--normalize", action="append", default=[], metavar="COL=RULE",
+                        help="compare a column its own way instead of the shared text rule; rules: "
+                             + ", ".join(sorted(NORMALIZERS)))
+    dedupe.add_argument("--compare", action="append", default=[], metavar="COL=KIND",
+                        help="say what kind of field a column is: text (default), exact, number or date")
+    dedupe.add_argument("--deterministic", action="append", default=[], metavar="COL",
+                        help="mark a column as one everyone spells the same way, so an exact rule on "
+                             "it may be trusted without asking the model")
     dedupe.add_argument("--id", metavar="COL", help="unique record ID; default: zero-based row number")
     _add_blocking(dedupe, "Default: 11 nearest text matches across all --on fields, because a record is "
                           "its own nearest match")
@@ -336,12 +370,49 @@ def _parser() -> argparse.ArgumentParser:
 
 def _fields(args: argparse.Namespace, left: pd.DataFrame, right: pd.DataFrame) -> list:
     on = [_column(item, unpaired=True) for item in args.on]
+    on = _with_field_settings(args, on)
     for _, a, b in parse_on(on, unpaired=True):
         check_columns(left, [a] if a is not None else [], args.left)
         check_columns(right, [b] if b is not None else [], args.right)
     ids(left, args.left_id, args.left)
     ids(right, args.right_id, args.right)
     return on
+
+
+def _with_field_settings(args: argparse.Namespace, on: list) -> list:
+    """Apply --normalize/--compare/--deterministic to the columns named in --on.
+
+    A setting names a column, and the Field is built for whichever `on` item carries it -- so
+    the flags compose with the existing --on forms (name, left=right, and the one-sided ones).
+    A name that no `on` item uses is an error, rather than a silent no-op.
+    """
+    normalizers = _column_settings(getattr(args, "normalize", []), label="--normalize", pattern="RULE")
+    compares = _column_settings(getattr(args, "compare", []), label="--compare", pattern="KIND")
+    deterministic = {c.strip() for c in getattr(args, "deterministic", []) if c.strip()}
+    unknown = set(normalizers) | set(compares) | deterministic
+    if not unknown:
+        return on
+    out = []
+    used = set()
+    for item in on:
+        label, a, b = parse_on([item], unpaired=True)[0]
+        names = {c for c in (label, a, b) if isinstance(c, str)}
+        hit = names & unknown
+        used |= hit
+        if not hit:
+            out.append(item)
+            continue
+        rule = next((normalizers[c] for c in (label, a, b) if c in normalizers), None)
+        kind = next((compares[c] for c in (label, a, b) if c in compares), "text")
+        if rule is not None and rule not in NORMALIZERS:
+            raise ValueError(f"--normalize {rule!r} is not a known rule; choose from "
+                             f"{', '.join(sorted(NORMALIZERS))}")
+        out.append(Field(label, a, b, normalize=NORMALIZERS[rule] if rule else None,
+                         compare=kind, judge=not (names & deterministic)))
+    if missing := unknown - used:
+        raise ValueError(f"--normalize/--compare/--deterministic name a column that --on does not use: "
+                         f"{', '.join(sorted(missing))}")
+    return out
 
 
 def _inputs(args: argparse.Namespace) -> tuple[pd.DataFrame, pd.DataFrame, list, list | None]:

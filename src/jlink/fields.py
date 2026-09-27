@@ -216,3 +216,34 @@ def ids(frame: pd.DataFrame, id_column: str | None, side: str) -> pd.Index:
         where = f"column {id_column!r}" if id_column else "index"
         raise ValueError(f"the {side} data's {where} has duplicate IDs; IDs must be unique")
     return values
+
+
+# Named normalizers for callers that cannot pass a callable, such as a command line. Each
+# takes a value and returns the string used for comparison. Keys are the names a CLI accepts.
+def digits_only(value: object) -> str:
+    """Keep only digits: '555-123-4567' -> '5551234567'."""
+    return re.sub(r"\D", "", str(value))
+
+
+def phone_main(value: object, keep_last: int = 10) -> str:
+    """A phone's main number: drop a trailing extension, then keep the last `keep_last` digits.
+
+    The extension must be removed before digits are counted, or its digits are taken for the
+    end of the number: '555-123-4567 ext 2222' would otherwise become '2345672222'.
+    """
+    text = re.sub(r"(?:e?xt?ension|ext|x|#)\s*[:.]?\s*\d{1,6}\s*$", " ", str(value), flags=re.I)
+    text = re.sub(r"\((?!\d{3}\))[^)]*\)", " ", text)     # (cell), (home) -- not (555)
+    digits = re.sub(r"\D", "", text)
+    if len(digits) == 11 and digits.startswith("1"):
+        digits = digits[1:]
+    return digits[-keep_last:] if len(digits) >= keep_last else digits
+
+
+def phone_extension(value: object) -> str:
+    """The extension digits of a phone string, or '' when it has none."""
+    found = re.search(r"(?:e?xt?ension|ext|x|#)\s*[:.]?\s*(\d{1,6})\s*$", str(value), flags=re.I)
+    return found.group(1) if found else ""
+
+
+NORMALIZERS = {"normalize": normalize, "digits": digits_only, "phone": phone_main,
+               "extension": phone_extension}

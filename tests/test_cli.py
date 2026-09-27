@@ -427,3 +427,59 @@ def test_cli_estimate_names_the_short_record_scenario(downstream, inputs, capsys
     assert "Judging cost scenario:" in output and "Judging time scenario:" in output
     assert "input tokens per pair (the runtime's estimate over a sample of these records)" in output
     assert "No API calls" in output
+
+
+# ------------------------------------------------- field contract on the CLI
+def test_column_settings_parse_and_reject_bad_forms():
+    assert command._column_settings(["phone=phone"], label="--normalize", pattern="RULE") == {"phone": "phone"}
+    assert command._column_settings([], label="--normalize", pattern="RULE") == {}
+    with pytest.raises(ValueError, match="COLUMN=RULE"):
+        command._column_settings(["phone"], label="--normalize", pattern="RULE")
+    with pytest.raises(ValueError, match="COLUMN=RULE"):
+        command._column_settings(["=phone"], label="--normalize", pattern="RULE")
+    with pytest.raises(ValueError, match="twice"):
+        command._column_settings(["phone=phone", "phone=digits"],
+                                 label="--normalize", pattern="RULE")
+
+
+def test_field_flags_build_a_field_for_the_named_column():
+    args = SimpleNamespace(on=["name", "phone"], normalize=["phone=phone"], compare=["phone=exact"],
+                           deterministic=[])
+    spec = command._with_field_settings(args, [command._column(i, unpaired=True) for i in args.on])
+    assert isinstance(spec[0], str) and spec[0] == "name"
+    assert isinstance(spec[1], command.Field)
+    assert spec[1].compare == "exact" and spec[1].judge is True
+    assert spec[1].normalizer()("555-123-4567 ext 2222") == "5551234567"
+
+
+def test_deterministic_flag_marks_the_field_as_not_needing_the_model():
+    args = SimpleNamespace(on=["phone"], normalize=["phone=phone"], compare=["phone=exact"],
+                           deterministic=["phone"])
+    spec = command._with_field_settings(args, ["phone"])
+    assert spec[0].judge is False
+
+
+def test_field_flags_apply_to_the_right_side_of_a_mapped_pair():
+    """name=phone maps columns; a setting may name either side."""
+    args = SimpleNamespace(on=["name=phone"], normalize=["phone=phone"], compare=[], deterministic=[])
+    spec = command._with_field_settings(args, [("name", "phone")])
+    assert spec[0].label == "name" and spec[0].right == "phone"
+    assert spec[0].normalizer()("5551234567") == "5551234567"
+
+
+def test_a_setting_for_an_unused_column_is_an_error_not_a_no_op():
+    args = SimpleNamespace(on=["name"], normalize=["phone=phone"], compare=[], deterministic=[])
+    with pytest.raises(ValueError, match="does not use"):
+        command._with_field_settings(args, ["name"])
+
+
+def test_unknown_normalizer_rule_is_rejected():
+    args = SimpleNamespace(on=["phone"], normalize=["phone=nonsense"], compare=[], deterministic=[])
+    with pytest.raises(ValueError, match="not a known rule"):
+        command._with_field_settings(args, ["phone"])
+
+
+def test_no_field_flags_leaves_on_untouched():
+    """The default path must produce exactly the objects it produced before."""
+    args = SimpleNamespace(on=["name"], normalize=[], compare=[], deterministic=[])
+    assert command._with_field_settings(args, ["name"]) == ["name"]
