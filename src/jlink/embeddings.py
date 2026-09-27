@@ -8,8 +8,8 @@ from numbers import Real
 import numpy as np
 import pandas as pd
 
-from .block import (_StreamingBlocker, _columns, _field_config, _pack_rows, _pass_fields,
-                    _positive_int, _top_k)
+from .block import (_StreamingBlocker, _columns, _field_config, _field_specs, _pack_rows,
+                    _pass_fields, _positive_int, _top_k)
 
 DEFAULT_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
 _QUERY_ROWS = 128
@@ -18,11 +18,14 @@ _INDEX_ROWS = 4096
 
 def serialize(frame: pd.DataFrame, fields: list, side: int) -> list[str]:
     """Preserve text and field boundaries; paired column names use the same left labels."""
+    index = 1 if side == 1 else 2
+    specs = _field_specs(fields)
+    columns = [(f.left if index == 1 else f.right) for f in specs]
     rows = []
-    for values in frame[[f[side] for f in fields]].itertuples(index=False, name=None):
-        record = {f[0]: str(v).strip() for f, v in zip(fields, values)
+    for values in frame[columns].itertuples(index=False, name=None):
+        record = {f.label: str(v).strip() for f, v in zip(specs, values)
                   if not pd.isna(v) and str(v).strip()}
-        rows.append((next(iter(record.values())) if len(fields) == 1 else
+        rows.append((next(iter(record.values())) if len(specs) == 1 else
                      json.dumps(record, ensure_ascii=False)) if record else "")
     return rows
 

@@ -20,7 +20,7 @@ from jevkit_runtime import Budget, Meter, Settings
 from jevkit_runtime import resolve as resolve_backend
 
 from .core import PROVIDERS
-from .fields import ids, parse_on
+from .fields import Field, ids, parse_fields
 from .judge import EXACT_POLICY, judge, pair_tokens, question, validate_budget, validate_question
 from .provenance import blocker_config, frame_fingerprint, input_fingerprints
 from .resolve import resolve
@@ -50,10 +50,10 @@ class Linker:
         self.entity, self.definition, self.on = (entity or "").strip() or None, (definition or "").strip(), on
         validate_question(self.entity, self.definition, style)
         self.style = style
-        self.fields = parse_on(on, unpaired=True)
+        self.fields = parse_fields(on, unpaired=True)
         if not isinstance(exact_shortcut, bool):
             raise ValueError("`exact_shortcut` must be a boolean; equal names alone do not establish identity")
-        if exact_shortcut and any(lc is None or rc is None for _, lc, rc in self.fields):
+        if exact_shortcut and any(spec.left is None or spec.right is None for spec in self.fields):
             raise ValueError("`exact_shortcut` accepts pairs whose fields are all equal, so every `on` field "
                              "must exist on both sides; remove the one-sided fields or the shortcut")
         self.blockers = blockers
@@ -141,9 +141,9 @@ class Linker:
         started_at = datetime.now(timezone.utc).isoformat()
         cands = block.self_candidates(frame, on=self.on, blockers=self.blockers, id=id, max_pairs=max_pairs)
         passes = self.blockers if self.blockers is not None else [
-            block.ngrams(*[lc for _, lc, _ in self.fields], k=11)]
+            block.ngrams(*[spec.left for spec in self.fields if spec.key], k=11)]
         configs = [blocker_config(b) for b in passes]
-        columns = [lc for _, lc, _ in self.fields]
+        columns = [spec.left for spec in self.fields]
         inputs = {"records": {
             "compared": frame_fingerprint(frame, id_column=id, columns=columns, side="deduplicated"),
             "full": frame_fingerprint(frame, id_column=id, columns=list(frame.columns), side="deduplicated")}}
@@ -170,7 +170,8 @@ class Linker:
         settings = {
             "jlink": __version__, "date": date.today().isoformat(), "entity": self.entity,
             "definition": self.definition, "question": asked,
-            "on": [[lc, rc] for _, lc, rc in self.fields], **specific,
+            "on": [[spec.left, spec.right] for spec in self.fields], **specific,
+            "fields": [spec.to_config() for spec in self.fields],
             "blockers": [b.name for b in passes], "blocker_configs": configs,
             "budget": _limit(budget), "model": meter.model,
             "calls": meter.calls, "cached": meter.cached, "input_tokens": meter.input_tokens,
@@ -182,7 +183,7 @@ class Linker:
             "resolved_models": meter.resolved_models, "unknown_model_answers": meter.unknown_model_answers,
             "answer_provenance": meter.answer_provenance,
             "exact_shortcut": self.exact_shortcut, "exact_policy": EXACT_POLICY,
-            "normalization": "jlink.fields.normalize_v1", "concurrency": int(self.concurrency),
+            "normalization": _normalization_summary(self.fields), "concurrency": int(self.concurrency),
             "cache_enabled": bool(self.cache), "max_pairs": None if max_pairs is None else int(max_pairs),
             "budget_policy": "stop_new_requests_at_observed_cost_v1",
             "cost_sources": meter.cost_sources, "estimated_price_per_million_tokens": Settings.from_env().list_price,
@@ -198,7 +199,41 @@ class Linker:
             settings["blocking"] = deepcopy(cands.attrs["blocking"])
         if "run" in scores.attrs:
             settings["run"] = deepcopy(scores.attrs["run"])  # the runtime's record: who answered, cost, budget
+        # A field contract is recorded only when it departs from plain columns, so a run over plain
+        # columns saves exactly the settings it did before.
+        if all(spec.is_default for spec in self.fields):
+            del settings["fields"]
         return settings
+
+
+def _normalization_summary(fields: list) -> str:
+    """The canonicalizers in play: the base text rule, plus each field's own type or custom rule."""
+    base = "jlink.fields.normalize_v1"
+    parts = []
+    for spec in fields:
+        if spec.normalize is not None:
+            parts.append(f"custom:{spec.label}")
+        elif spec.compare != "text":
+            parts.append(f"{spec.compare}:{spec.label}")
+    return base if not parts else f"{base}+{','.join(parts)}"
+
+
+def _saved_fields(settings: dict) -> list:
+    """Rebuild a saved run's fields from its `fields`/`on` settings, types and all.
+
+    A run that named no type has no `fields` key, so its plain `on` pairs are reproduced exactly.
+    A `custom_normalizer` cannot be restored from JSON -- the run only records that one existed --
+    so it is left off; a resumed run keeps the same keys only for the named types it recorded.
+    """
+    saved = settings.get("fields")
+    pairs = [tuple(pair) for pair in settings["on"]]
+    if not saved:
+        return [Field(left or right, left, right) for left, right in pairs]
+    specs = []
+    for (left, right), spec in zip(pairs, saved):
+        specs.append(Field(left or right, left, right, compare=spec.get("compare", "text"),
+                           key=spec.get("key", True), deterministic=spec.get("deterministic", False)))
+    return specs
 
 
 def link(left: pd.DataFrame, right: pd.DataFrame, *, entity: str | None = None, on, definition: str = "",
@@ -257,9 +292,8 @@ class Result:
         validate_budget(budget)
         left, right = self._frames(left, right)
         s = deepcopy(self.settings)
-        on = [(lc, rc) for lc, rc in s["on"]]
         if "inputs" in s:
-            now = input_fingerprints(left, right, fields=parse_on(on, unpaired=True),
+            now = input_fingerprints(left, right, fields=_saved_fields(s),
                                      left_id=s["left_id"], right_id=s["right_id"])
             for side in ("left", "right"):
                 if now[side]["compared"]["sha256"] != s["inputs"][side]["compared"]["sha256"]:
@@ -275,8 +309,8 @@ class Result:
         t0, started_at = time.perf_counter(), datetime.now(timezone.utc).isoformat()
         api = api or s.get("provider") or s.get("requested_api")
         model = model or s.get("request_model") or s.get("requested_model")
-        fresh, meter = judge(self.scores.loc[todo, ["left_id", "right_id", "block", "sim"]], left, right, on=on,
-                             entity=s["entity"], definition=s["definition"], style=style,
+        fresh, meter = judge(self.scores.loc[todo, ["left_id", "right_id", "block", "sim"]], left, right,
+                             on=_saved_fields(s), entity=s["entity"], definition=s["definition"], style=style,
                              left_id=s["left_id"], right_id=s["right_id"], api=api, model=model,
                              concurrency=concurrency, budget=budget, cache=cache, progress=progress,
                              transport=transport)

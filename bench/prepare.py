@@ -2,6 +2,17 @@
 
 from __future__ import annotations
 
+# What each dataset's on fields are, for reference. The benchmark itself keeps plain column names so
+# its numbers stay comparable; these are the types a run could give them. price is judge-only because
+# it is evidence for the model, not an identifier: exact equality on a price is coincidence.
+REFERENCE_TYPES = {
+    "dblp-acm": {"year": "date"},
+    "abt-buy": {"price": "judge_only"},
+    "amazon-google": {"price": "judge_only"},
+    "febrl4": {"date_of_birth": "date", "postcode": "digits"},
+    "nber-firms": {},
+}
+
 import argparse
 from datetime import datetime, timezone
 import hashlib

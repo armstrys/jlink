@@ -1,5 +1,23 @@
 # Changelog
 
+## Unreleased
+
+- **Typed field linking.** An `on` field can name what kind of value it holds, so keying, blocking
+  and judge-visible text follow the type instead of one text rule. `Field(..., compare=KIND)` (or the
+  CLI's `--type COL=KIND`) takes `text` (the default), `exact`, `digits` or `date`; each supplies a
+  canonicalizer and a default pass. `digits` keeps leading zeros and drops fractions (`"0200"`
+  stays distinct; `20.5` is dropped, not flattened to `205`); `date` reads ISO-shaped year-first
+  dates and a bare year, and drops anything ambiguous such as `03/01/2024` rather than guess. A
+  value that does not parse is dropped and counted, never guessed, matching the window pass.
+- `Field(key=False)` marks a field the judge sees but that is never keyed, scored in `sim`, or
+  settled by the exact shortcut -- the mechanism for a price, description or note. A plain column
+  name or `(left, right)` pair behaves exactly as before, and a config over plain columns saves
+  byte-identical settings.
+- `Field(..., deterministic=True)` on a typed field settles an equal, present key with no model
+  call, recorded as `source="exact"`. A custom `normalize=` callable replaces the canonicalizer
+  and is recorded in provenance as `custom`, never stored. No phone-specific export or CLI rule:
+  it is a worked example in the docs.
+
 ## 0.5.0
 
 On `jevkit-runtime` 0.4 ([jevkit-core#14](https://github.com/keltokhy/jevkit-core/issues/14)).
