@@ -82,8 +82,9 @@ def parse_fields(on, *, unpaired: bool = False) -> list[Field]:
                                  f"{', '.join(COMPARES)}; got {field.compare!r}")
             if not isinstance(field.judge, bool):
                 raise ValueError(f"field {field.label!r}: `judge` must be a boolean")
-            if (field.left is None) == (field.right is None):
-                raise ValueError(f"field {field.label!r}: exactly one of `left`/`right` may be None")
+            if (field.left is None) and (field.right is None):
+                raise ValueError(f"each `on` item is a column name, a (left, right) pair of names, or a "
+                                 f"one-sided (left, None) or (None, right); got {(field.left, field.right)!r}")
             if field.left is None or field.right is None:
                 if not unpaired:
                     raise ValueError(f"the field {(field.left, field.right)!r} exists on one side only, "
@@ -180,15 +181,18 @@ def key_text(value: object, normalizer: Callable[[object], str] | None = None) -
     float in pandas, and a table written from it says "1985.0", so the integer 1985, the float
     1985.0 and the texts "1985" and "1985.0" all give "1985".
 
-    ``normalizer`` lets a field supply its own normalization, for example digits-only for a
-    phone number. It defaults to :func:`normalize`.
+    The whole-number reconciliation above is skipped when a ``normalizer`` is given: the field's
+    own rule sees the original value, so a custom normalizer is not surprised by an int where it
+    was given a string.
     """
+    if normalizer is not None:
+        return "" if (cleaned := clean(value)) is None else normalizer(cleaned)
     value = clean(value)
     if isinstance(value, float) and value.is_integer():
         value = int(value)  # clean() leaves whole floats from 1e15 up as floats; sixteen-digit keys exist
     elif isinstance(value, str) and _WHOLE_DECIMAL.fullmatch(value):
         value = value[:value.index(".")]
-    return (normalizer or normalize)(value)
+    return normalize(value)
 
 
 def record_text(frame: pd.DataFrame, columns: list[str]) -> pd.Series:

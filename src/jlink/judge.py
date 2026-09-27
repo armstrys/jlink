@@ -35,7 +35,7 @@ from jevkit_runtime.cli import run_sync
 
 from . import __version__
 from .core import PROVIDERS
-from .fields import check_columns, clean, ids, normalize, parse_on, side_fields
+from .fields import check_columns, clean, ids, normalize, parse_fields, parse_on, side_fields
 
 SCORE_COLUMNS = ["p", "source", "error"]
 EXACT_POLICY = "all_fields_nonempty_and_equal_v1"
@@ -110,13 +110,13 @@ def judge(candidates: pd.DataFrame, left: pd.DataFrame, right: pd.DataFrame, *, 
     for column in ("left_id", "right_id", "sim"):
         if column not in candidates.columns:
             raise ValueError(f"candidates must have a {column!r} column; build them with jlink.block.candidates")
-    fields = parse_on(on, unpaired=True)
-    shown_left, shown_right = side_fields(fields, "left"), side_fields(fields, "right")
-    if exact_shortcut and any(lc is None or rc is None for _, lc, rc in fields):
+    fields = parse_fields(on, unpaired=True)
+    shown_left, shown_right = _side_specs(fields, "left"), _side_specs(fields, "right")
+    if exact_shortcut and any(f.left is None or f.right is None for f in fields):
         raise ValueError("`exact_shortcut` accepts pairs whose fields are all equal, so every `on` field "
                          "must exist on both sides; remove the one-sided fields or the shortcut")
-    check_columns(left, [c for _, c in shown_left], "left")
-    check_columns(right, [c for _, c in shown_right], "right")
+    check_columns(left, [c for _, c, _ in shown_left], "left")
+    check_columns(right, [c for _, c, _ in shown_right], "right")
 
     a = _records(left, ids(left, left_id, "left"), shown_left)
     b = _records(right, ids(right, right_id, "right"), shown_right)
@@ -211,12 +211,27 @@ def judge(candidates: pd.DataFrame, left: pd.DataFrame, right: pd.DataFrame, *, 
     return scores, jev.meter
 
 
-def _records(frame: pd.DataFrame, index: pd.Index, fields: list[tuple[str, str]]) -> pd.DataFrame:
-    """Per ID: the judge's record and a fieldwise key, absent if any field normalizes to empty."""
-    columns = [c for _, c in fields]
+def _side_specs(fields: list, side: str) -> list[tuple[str, str, object]]:
+    """[(label, column, normalizer), ...] for one side, keeping each field's own normalizer."""
+    out = []
+    for field in fields:
+        column = field.left if side == "left" else field.right
+        if column is not None:
+            out.append((field.label, column, field.normalize))
+    return out
+
+
+def _records(frame: pd.DataFrame, index: pd.Index, fields: list) -> pd.DataFrame:
+    """Per ID: the judge's record and a fieldwise key, absent if any field normalizes to empty.
+
+    ``fields`` is a list of ``(label, column, normalizer)`` triples, or the older
+    ``(label, column)`` pairs, which use the shared default normalizer.
+    """
+    specs = [(f[0], f[1], f[2] if len(f) > 2 else None) for f in fields]
+    columns = [c for _, c, _ in specs]
     rows = frame[columns].to_dict("records")
-    record = [{label: v for (label, c) in fields if (v := clean(row[c])) is not None} for row in rows]
-    keys = [tuple(normalize(clean(row[c])) for c in columns) for row in rows]
+    record = [{label: v for (label, c, _) in specs if (v := clean(row[c])) is not None} for row in rows]
+    keys = [tuple((n or normalize)(clean(row[c])) for _, c, n in specs) for row in rows]
     return pd.DataFrame({"record": record, "exact_key": [key if all(key) else None for key in keys]}, index=index)
 
 
@@ -227,9 +242,9 @@ def pair_tokens(candidates: pd.DataFrame, left: pd.DataFrame, right: pd.DataFram
     records; None without candidates."""
     if not len(candidates):
         return None
-    fields = parse_on(on, unpaired=True)
-    a = _records(left, ids(left, left_id, "left"), side_fields(fields, "left"))["record"].to_dict()
-    b = _records(right, ids(right, right_id, "right"), side_fields(fields, "right"))["record"].to_dict()
+    fields = parse_fields(on, unpaired=True)
+    a = _records(left, ids(left, left_id, "left"), _side_specs(fields, "left"))["record"].to_dict()
+    b = _records(right, ids(right, right_id, "right"), _side_specs(fields, "right"))["record"].to_dict()
     pairs = candidates.sample(n=min(sample, len(candidates)), random_state=seed)
     ask = {"match": question(entity or "", definition, style=style)}
     sizes = [estimate_tokens(request_body(model, {"record_a": a[l], "record_b": b[r]}, ask))

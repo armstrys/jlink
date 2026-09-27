@@ -91,17 +91,30 @@ def _pack_rows(rows) -> Iterator[np.ndarray]:
         yield output[:count].copy()
 
 
-def _keys(frame: pd.DataFrame, columns: list[str]):
+def _keys(frame: pd.DataFrame, columns: list[str], normalizers: list | None = None):
     # Object conversion makes categorical nulls and datetime NaT follow the same
     # missing-key policy as None, rather than surviving map() as nonempty keys.
     # key_text lets an integer year meet the same year stored as a float or as "1985.0".
-    return zip(*(frame[c].astype(object).where(frame[c].notna(), None).map(key_text)
-                 for c in columns))
+    # A field's own normalizer, when it has one, replaces the shared default for that column.
+    normalizers = normalizers or [None] * len(columns)
+    return zip(*(frame[c].astype(object).where(frame[c].notna(), None)
+                 .map(lambda v, n=n: key_text(v, n))
+                 for c, n in zip(columns, normalizers)))
 
 
-def _groups(frame: pd.DataFrame, columns: list[str], missing: str = "drop") -> dict:
+def _field_normalizers(fields: list) -> list:
+    """Per-column normalizers for an already-paired field list, or None where the default applies."""
+    out = []
+    for field in fields:
+        custom = getattr(field, "normalize", None) if not isinstance(field, tuple) else None
+        out.append(custom)
+    return out
+
+
+def _groups(frame: pd.DataFrame, columns: list[str], missing: str = "drop",
+            normalizers: list | None = None) -> dict:
     groups = {}
-    for i, key in enumerate(_keys(frame, columns)):
+    for i, key in enumerate(_keys(frame, columns, normalizers)):
         if missing == "match" or all(key):
             groups.setdefault(key, []).append(i)
     return groups
