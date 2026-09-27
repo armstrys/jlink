@@ -427,3 +427,65 @@ def test_cli_estimate_names_the_short_record_scenario(downstream, inputs, capsys
     assert "Judging cost scenario:" in output and "Judging time scenario:" in output
     assert "input tokens per pair (the runtime's estimate over a sample of these records)" in output
     assert "No API calls" in output
+
+
+# ------------------------------------------------- field contract on the CLI
+def test_column_settings_parse_and_reject_bad_forms():
+    assert command._column_settings(["phone=phone"], label="--normalize", pattern="RULE") == {"phone": "phone"}
+    assert command._column_settings([], label="--normalize", pattern="RULE") == {}
+    with pytest.raises(ValueError, match="COLUMN=RULE"):
+        command._column_settings(["phone"], label="--normalize", pattern="RULE")
+    with pytest.raises(ValueError, match="COLUMN=RULE"):
+        command._column_settings(["=phone"], label="--normalize", pattern="RULE")
+    with pytest.raises(ValueError, match="twice"):
+        command._column_settings(["phone=phone", "phone=digits"],
+                                 label="--normalize", pattern="RULE")
+
+
+def test_field_flags_build_a_field_for_the_named_column_only():
+    """A flag turns the item it names into a Field; untouched items keep their plain form."""
+    args = SimpleNamespace(on=["name", "phone"], normalize=["phone=phone"], compare=["phone=exact"],
+                           deterministic=["phone"])
+    spec = command._with_field_settings(args, [command._column(i, unpaired=True) for i in args.on])
+    assert spec[0] == "name", "an untouched item stays a plain name"
+    assert isinstance(spec[1], command.Field)
+    assert spec[1].compare == "exact" and spec[1].judge is False
+    assert spec[1].normalizer()("555-123-4567 ext 2222") == "5551234567"
+
+
+def test_field_flags_compose_with_a_one_sided_on_item():
+    """One-sided items are valid only in a list covering both sides; parse the whole list at once."""
+    args = SimpleNamespace(on=["name", "=place", "phone"], normalize=["phone=phone"],
+                           compare=[], deterministic=[])
+    on = [command._column(item, unpaired=True) for item in args.on]
+    spec = command._with_field_settings(args, on)
+    assert spec[0] == "name" and spec[1] == (None, "place")
+    assert isinstance(spec[2], command.Field) and spec[2].normalizer()("555.123.4567") == "5551234567"
+
+
+def test_field_flags_apply_to_a_block_column():
+    kind, columns, options = command._block_spec("exact:phone")
+    names = command._block_column_names([[kind, columns, options]])
+    args = SimpleNamespace(on=["name"], normalize=["phone=phone"], compare=[], deterministic=[])
+    spec = command._with_field_settings(args, columns, extra_names=names)
+    assert isinstance(spec[0], command.Field) and spec[0].normalizer()("555.123.4567") == "5551234567"
+
+
+def test_a_setting_for_an_unused_column_is_an_error_not_a_no_op():
+    args = SimpleNamespace(on=["name"], normalize=["phone=phone"], compare=[], deterministic=[])
+    with pytest.raises(ValueError, match="does not use"):
+        command._with_field_settings(args, ["name"])
+
+
+def test_an_unknown_field_choice_is_rejected():
+    for flags in ({"normalize": ["phone=nonsense"]}, {"compare": ["phone=bogus"]}):
+        base = {"on": ["phone"], "normalize": [], "compare": [], "deterministic": []} | flags
+        args = SimpleNamespace(**base)
+        with pytest.raises(ValueError, match="not a known choice"):
+            command._with_field_settings(args, ["phone"])
+
+
+def test_no_field_flags_leaves_on_untouched():
+    """The default path must produce exactly the objects it produced before."""
+    args = SimpleNamespace(on=["name"], normalize=[], compare=[], deterministic=[])
+    assert command._with_field_settings(args, ["name"]) == ["name"]
