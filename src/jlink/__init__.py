@@ -12,6 +12,7 @@ __version__ = "0.5.0"
 from . import block  # noqa: E402
 from .audit import Evaluation, audit_sample, evaluate, score_against_truth  # noqa: E402
 from .cluster import cluster  # noqa: E402
+from .fields import Field, digits_only, phone_extension, phone_main  # noqa: E402
 from .judge import judge  # noqa: E402
 from .linker import DedupeResult, Linker, Result, dedupe, link, load  # noqa: E402
 from .resolve import resolve  # noqa: E402
@@ -19,4 +20,5 @@ from .review import Review, ReviewedLinks, create_review, read_review  # noqa: E
 
 __all__ = ["Linker", "Result", "link", "load", "block", "judge", "resolve", "audit_sample", "evaluate",
            "score_against_truth", "Evaluation", "__version__", "Review", "ReviewedLinks", "create_review",
-           "read_review", "dedupe", "DedupeResult", "cluster"]
+           "read_review", "dedupe", "DedupeResult", "cluster", "Field", "digits_only", "phone_main",
+           "phone_extension"]

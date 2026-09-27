@@ -15,7 +15,7 @@ from jevkit_runtime.cli import parse_budget
 
 from . import __version__
 from .core import PROVIDERS
-from .fields import check_columns, ids, parse_on
+from .fields import COMPARES, NORMALIZERS, Field, check_columns, ids, parse_fields, parse_on
 from .io import FORMATS, read_table, stata_value_labels, write_table
 
 _BLOCK_FORMS = ("ngrams:name:10, ngrams-reverse:name:10, embeddings:name:10, ngrams:name+city:20, exact:state, initials:name, "
@@ -120,10 +120,36 @@ def _add_fields(parser: argparse.ArgumentParser, *, required: bool = True) -> No
                         help="field to compare; repeat for more fields (city=town uses different names; "
                              "text= shows a field only the left records have, \"=place\" only the right; "
                              "quote a leading = because zsh expands it)")
+    parser.add_argument("--normalize", action="append", default=[], metavar="COL=RULE",
+                        help="compare a column its own way instead of the shared text rule; repeat as "
+                             "needed. Rules: " + ", ".join(sorted(NORMALIZERS)) +
+                             " (digits keeps only digits; phone drops a trailing extension and keeps "
+                             "the last ten digits; extension keeps just the extension digits)")
+    parser.add_argument("--compare", action="append", default=[], metavar="COL=KIND",
+                        help="say what kind of field a column is, so default blocking can suit it: "
+                             "text (default), exact, number or date; repeat as needed")
+    parser.add_argument("--deterministic", action="append", default=[], metavar="COL",
+                        help="mark a column as a name everyone spells the same way, so an exact rule "
+                             "on it may be trusted without asking the model; repeat as needed")
     parser.add_argument("--left-id", metavar="COL",
                         help="unique left record ID; default: zero-based row number")
     parser.add_argument("--right-id", metavar="COL",
                         help="unique right record ID; default: zero-based row number")
+
+
+def _column_settings(values: list, *, label: str, pattern: str) -> dict:
+    """Parse repeated COL=VALUE flags into {column: value}, rejecting a missing or repeated assignment."""
+    out: dict[str, str] = {}
+    for item in values:
+        if item.count("=") != 1:
+            raise ValueError(f"{label} must be COLUMN={pattern}; got {item!r}")
+        column, value = item.split("=")
+        if not column.strip() or not value.strip():
+            raise ValueError(f"{label} must be COLUMN={pattern}; got {item!r}")
+        if column in out and out[column] != value:
+            raise ValueError(f"{label} names column {column!r} twice with different values")
+        out[column.strip()] = value.strip()
+    return out
 
 
 def _add_question(parser: argparse.ArgumentParser) -> None:
@@ -259,6 +285,14 @@ def _parser() -> argparse.ArgumentParser:
     dedupe.add_argument("table", metavar="TABLE", help=".csv, .tsv, .dta or .parquet file to deduplicate")
     dedupe.add_argument("--on", action="append", required=True, metavar="COL",
                         help="field to compare; repeat for more fields")
+    dedupe.add_argument("--normalize", action="append", default=[], metavar="COL=RULE",
+                        help="compare a column its own way instead of the shared text rule; rules: "
+                             + ", ".join(sorted(NORMALIZERS)))
+    dedupe.add_argument("--compare", action="append", default=[], metavar="COL=KIND",
+                        help="say what kind of field a column is: text (default), exact, number or date")
+    dedupe.add_argument("--deterministic", action="append", default=[], metavar="COL",
+                        help="mark a column as one everyone spells the same way, so an exact rule on "
+                             "it may be trusted without asking the model")
     dedupe.add_argument("--id", metavar="COL", help="unique record ID; default: zero-based row number")
     _add_blocking(dedupe, "Default: 11 nearest text matches across all --on fields, because a record is "
                           "its own nearest match")
@@ -335,13 +369,56 @@ def _parser() -> argparse.ArgumentParser:
 
 
 def _fields(args: argparse.Namespace, left: pd.DataFrame, right: pd.DataFrame) -> list:
+    specs = [_block_spec(rule) for rule in getattr(args, "block", None) or []]
     on = [_column(item, unpaired=True) for item in args.on]
+    on = _with_field_settings(args, on, extra_names=_block_column_names(specs))
     for _, a, b in parse_on(on, unpaired=True):
         check_columns(left, [a] if a is not None else [], args.left)
         check_columns(right, [b] if b is not None else [], args.right)
     ids(left, args.left_id, args.left)
     ids(right, args.right_id, args.right)
     return on
+
+
+def _with_field_settings(args: argparse.Namespace, on: list, extra_names: set | None = None) -> list:
+    """Apply --normalize/--compare/--deterministic to the columns named in --on (or --block).
+
+    A setting names a column, and the Field is built for whichever `on` item carries it -- so
+    the flags compose with the existing --on forms (name, left=right, and the one-sided ones).
+    Parse the items together, not one at a time: a lone one-sided item is valid only as part of a
+    list covering both sides, so judging it alone would wrongly reject it. A name that neither
+    `--on` nor `--block` uses is an error, rather than a silent no-op.
+    """
+    normalizers = _column_settings(getattr(args, "normalize", []), label="--normalize", pattern="RULE")
+    compares = _column_settings(getattr(args, "compare", []), label="--compare", pattern="KIND")
+    deterministic = {c.strip() for c in getattr(args, "deterministic", []) if c.strip()}
+    unknown = set(normalizers) | set(compares) | deterministic
+    if not unknown:
+        return on
+    for kind, values in (("--normalize", normalizers), ("--compare", compares)):
+        allowed = NORMALIZERS if kind == "--normalize" else COMPARES
+        for rule in values.values():
+            if rule not in allowed:
+                raise ValueError(f"{kind} {rule!r} is not a known choice; choose from "
+                                 f"{', '.join(sorted(allowed))}")
+    specs = parse_fields(on, unpaired=True)
+    used = {c for s in specs for c in (s.label, s.left, s.right) if isinstance(c, str)}
+    if missing := unknown - used - (extra_names or set()):
+        raise ValueError(f"--normalize/--compare/--deterministic name a column that --on or --block "
+                         f"does not use: {', '.join(sorted(missing))}")
+    out = []
+    for item, spec in zip(on, specs):
+        columns = (spec.label, spec.left, spec.right)
+        names = {c for c in columns if isinstance(c, str)}
+        if not names & unknown:
+            out.append(item)  # untouched: keep the plain name or pair the constructor always got
+            continue
+        rule = next((normalizers[c] for c in columns if c in normalizers), None)
+        kind = next((compares[c] for c in columns if c in compares), spec.compare)
+        out.append(Field(spec.label, spec.left, spec.right,
+                         normalize=NORMALIZERS[rule] if rule else spec.normalize,
+                         compare=kind, judge=False if names & deterministic else spec.judge))
+    return out
 
 
 def _inputs(args: argparse.Namespace) -> tuple[pd.DataFrame, pd.DataFrame, list, list | None]:
@@ -352,14 +429,31 @@ def _inputs(args: argparse.Namespace) -> tuple[pd.DataFrame, pd.DataFrame, list,
     return left, right, on, _blockers(args, specs, left, right, args.left, args.right)
 
 
+def _block_column_names(specs: list) -> set:
+    """Every column named by a --block rule, including a nested within rule's child."""
+    names = set()
+    for _, columns, options in specs:
+        for item in columns:
+            label, a, b = parse_on([item])[0]
+            names |= {c for c in (label, a, b) if isinstance(c, str)}
+        if options.get("child"):
+            names |= _block_column_names([options["child"]])
+    return names
+
+
 def _blockers(args: argparse.Namespace, specs: list, left: pd.DataFrame, right: pd.DataFrame,
               left_name: str, right_name: str) -> list | None:
     blockers = None
     if specs:
         from . import block
 
+        named = _block_column_names(specs)
+
         def build(spec):
             kind, columns, options = spec
+            # Apply the field flags to a pass's columns too, so --block exact:phone can carry
+            # the phone rule rather than keying the pass on the shared text rule.
+            columns = _with_field_settings(args, columns, extra_names=named)
             for _, a, b in parse_on(columns):
                 check_columns(left, [a], left_name)
                 check_columns(right, [b], right_name)
@@ -534,6 +628,9 @@ def _dedupe(args: argparse.Namespace) -> None:
     specs = [_block_spec(rule) for rule in args.block or []]
     frame = read_table(args.table)
     on = [_column(item) for item in args.on]
+    # The field flags are registered for this subcommand, so apply them here rather than
+    # accepting a valid flag and quietly ignoring it.
+    on = _with_field_settings(args, on, extra_names=_block_column_names(specs))
     for _, a, b in parse_on(on):
         check_columns(frame, [a, b], args.table)
     ids(frame, args.id, args.table)

@@ -12,6 +12,7 @@ import math
 import warnings
 from numbers import Integral, Real
 from pathlib import Path
+from typing import Callable
 
 import numpy as np
 import pandas as pd
@@ -35,7 +36,7 @@ from jevkit_runtime.cli import run_sync
 
 from . import __version__
 from .core import PROVIDERS
-from .fields import check_columns, clean, ids, normalize, parse_on, side_fields
+from .fields import check_columns, clean, ids, normalize, parse_fields, parse_on, side_fields
 
 SCORE_COLUMNS = ["p", "source", "error"]
 EXACT_POLICY = "all_fields_nonempty_and_equal_v1"
@@ -110,16 +111,24 @@ def judge(candidates: pd.DataFrame, left: pd.DataFrame, right: pd.DataFrame, *, 
     for column in ("left_id", "right_id", "sim"):
         if column not in candidates.columns:
             raise ValueError(f"candidates must have a {column!r} column; build them with jlink.block.candidates")
-    fields = parse_on(on, unpaired=True)
-    shown_left, shown_right = side_fields(fields, "left"), side_fields(fields, "right")
-    if exact_shortcut and any(lc is None or rc is None for _, lc, rc in fields):
+    fields = parse_fields(on, unpaired=True)
+    shown_left, shown_right = _side_specs(fields, "left"), _side_specs(fields, "right")
+    if exact_shortcut and any(f.left is None or f.right is None for f in fields):
         raise ValueError("`exact_shortcut` accepts pairs whose fields are all equal, so every `on` field "
                          "must exist on both sides; remove the one-sided fields or the shortcut")
-    check_columns(left, [c for _, c in shown_left], "left")
-    check_columns(right, [c for _, c in shown_right], "right")
+    # A field marked `judge=False` is one the caller knows everyone spells the same way. A pair
+    # equal on those fields, with every one of them present, needs no model: the caller said so.
+    # This is the per-field form of `exact_shortcut`, and the two may be used together.
+    deterministic_keys = any(f.judge is False for f in fields)
+    if deterministic_keys and any(f.judge is False and (f.left is None or f.right is None) for f in fields):
+        raise ValueError("a `judge=False` field is compared for equality, so it must exist on both "
+                         "sides; remove the one-sided field or stop marking it deterministic")
+    check_columns(left, [c for _, c, _, _ in shown_left], "left")
+    check_columns(right, [c for _, c, _, _ in shown_right], "right")
 
-    a = _records(left, ids(left, left_id, "left"), shown_left)
-    b = _records(right, ids(right, right_id, "right"), shown_right)
+    keys_from = _specs_key_selector(fields, exact_shortcut=exact_shortcut)
+    a = _records(left, ids(left, left_id, "left"), shown_left, keys_from)
+    b = _records(right, ids(right, right_id, "right"), shown_right, keys_from)
     for side, known, column in (("left", a, "left_id"), ("right", b, "right_id")):
         unknown = ~candidates[column].isin(known.index)
         if unknown.any():
@@ -133,7 +142,7 @@ def judge(candidates: pd.DataFrame, left: pd.DataFrame, right: pd.DataFrame, *, 
     models, providers, origins = (np.full(n, pd.NA, dtype=object) for _ in range(3))
     answered_at = np.full(n, np.nan)
 
-    if exact_shortcut and n:
+    if (exact_shortcut or deterministic_keys) and n:
         keys_a, keys_b = a["exact_key"].reindex(left_ids), b["exact_key"].reindex(right_ids)
         same = np.array([ka is not None and ka == kb for ka, kb in zip(keys_a, keys_b)], dtype=bool)
         p[same], source[same] = 1.0, "exact"
@@ -211,12 +220,43 @@ def judge(candidates: pd.DataFrame, left: pd.DataFrame, right: pd.DataFrame, *, 
     return scores, jev.meter
 
 
-def _records(frame: pd.DataFrame, index: pd.Index, fields: list[tuple[str, str]]) -> pd.DataFrame:
-    """Per ID: the judge's record and a fieldwise key, absent if any field normalizes to empty."""
-    columns = [c for _, c in fields]
+def _specs_key_selector(fields: list, *, exact_shortcut: bool):
+    """Which field specs contribute to ``exact_key``, or None for the default (all of them).
+
+    ``exact_shortcut`` wants a pair equal on every field, so it uses all of them. A field marked
+    ``judge=False`` settles on its own, so without the shortcut the key covers only those fields
+    -- otherwise a differing name would block a pair whose phone number is already conclusive.
+    """
+    if exact_shortcut or not any(f.judge is False for f in fields):
+        return None
+    return lambda specs: all(s[3] is False for s in specs)
+
+
+def _side_specs(fields: list, side: str) -> list[tuple[str, str, object, bool]]:
+    """[(label, column, normalizer, is_deterministic), ...] for one side."""
+    out = []
+    for field in fields:
+        column = field.left if side == "left" else field.right
+        if column is not None:
+            out.append((field.label, column, field.normalize, field.judge))
+    return out
+
+
+def _records(frame: pd.DataFrame, index: pd.Index, fields: list,
+             keys_from: Callable[[list], bool] | None = None) -> pd.DataFrame:
+    """Per ID: the judge's record and a fieldwise key, absent if any field normalizes to empty.
+
+    ``fields`` is a list of ``(label, column, normalizer)`` or ``(label, column, normalizer,
+    judge)`` tuples, or the older ``(label, column)`` pairs, which use the shared default
+    normalizer. ``keys_from`` selects which specs contribute to ``exact_key``; by default all do.
+    A deterministic pair is one whose key is present and equal on both sides.
+    """
+    specs = [(f[0], f[1], f[2] if len(f) > 2 else None, f[3] if len(f) > 3 else True) for f in fields]
+    keyed = [s for s in specs if keys_from is None or keys_from([s])]
+    columns = [c for _, c, _, _ in specs]
     rows = frame[columns].to_dict("records")
-    record = [{label: v for (label, c) in fields if (v := clean(row[c])) is not None} for row in rows]
-    keys = [tuple(normalize(clean(row[c])) for c in columns) for row in rows]
+    record = [{label: v for (label, c, _, _) in specs if (v := clean(row[c])) is not None} for row in rows]
+    keys = [tuple((n or normalize)(clean(row[c])) for _, c, n, _ in keyed) for row in rows]
     return pd.DataFrame({"record": record, "exact_key": [key if all(key) else None for key in keys]}, index=index)
 
 
@@ -227,9 +267,9 @@ def pair_tokens(candidates: pd.DataFrame, left: pd.DataFrame, right: pd.DataFram
     records; None without candidates."""
     if not len(candidates):
         return None
-    fields = parse_on(on, unpaired=True)
-    a = _records(left, ids(left, left_id, "left"), side_fields(fields, "left"))["record"].to_dict()
-    b = _records(right, ids(right, right_id, "right"), side_fields(fields, "right"))["record"].to_dict()
+    fields = parse_fields(on, unpaired=True)
+    a = _records(left, ids(left, left_id, "left"), _side_specs(fields, "left"))["record"].to_dict()
+    b = _records(right, ids(right, right_id, "right"), _side_specs(fields, "right"))["record"].to_dict()
     pairs = candidates.sample(n=min(sample, len(candidates)), random_state=seed)
     ask = {"match": question(entity or "", definition, style=style)}
     sizes = [estimate_tokens(request_body(model, {"record_a": a[l], "record_b": b[r]}, ask))

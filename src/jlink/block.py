@@ -15,7 +15,8 @@ import pandas as pd
 from scipy.sparse import csr_matrix
 from sklearn.feature_extraction.text import TfidfVectorizer
 
-from .fields import check_columns, ids, key_text, normalize, parse_on, record_text, side_fields
+from .fields import (Field, check_columns, ids, key_text, normalize, parse_fields, parse_on,
+                     record_text, side_fields)
 
 # Bound even a fully populated sparse product to about 64 MiB (float64 + int32).
 _CHUNK_ROWS = 256
@@ -66,8 +67,18 @@ class _StreamingBlocker(Blocker):
 
 
 def _field_config(kind: str, blocker: Blocker) -> dict:
-    return {"type": kind, "name": blocker.name,
-            "columns": [[a, b] for _, a, b in blocker.fields]}
+    """A pass's JSON-safe configuration. A field contract travels with the columns that have one.
+
+    ``columns`` keeps its historical shape and is always present; a ``fields`` key is added only
+    when a field names its own compare rule, judging policy or normalizer, so a pass over plain
+    columns saves exactly the configuration it did before.
+    """
+    config = {"type": kind, "name": blocker.name,
+              "columns": [[a, b] for _, a, b in blocker.fields]}
+    specs = blocker.fields.specs() if isinstance(blocker.fields, _PassFields) else []
+    if any(s.normalize is not None or s.compare != "text" or s.judge is not True for s in specs):
+        config["fields"] = [s.to_config() for s in specs]
+    return config
 
 
 def _pack_rows(rows) -> Iterator[np.ndarray]:
@@ -91,17 +102,21 @@ def _pack_rows(rows) -> Iterator[np.ndarray]:
         yield output[:count].copy()
 
 
-def _keys(frame: pd.DataFrame, columns: list[str]):
+def _keys(frame: pd.DataFrame, columns: list[str], normalizers: list | None = None):
     # Object conversion makes categorical nulls and datetime NaT follow the same
     # missing-key policy as None, rather than surviving map() as nonempty keys.
     # key_text lets an integer year meet the same year stored as a float or as "1985.0".
-    return zip(*(frame[c].astype(object).where(frame[c].notna(), None).map(key_text)
-                 for c in columns))
+    # A field's own normalizer, when it has one, replaces the shared default for that column.
+    normalizers = normalizers or [None] * len(columns)
+    return zip(*(frame[c].astype(object).where(frame[c].notna(), None)
+                 .map(lambda v, n=n: key_text(v, n))
+                 for c, n in zip(columns, normalizers)))
 
 
-def _groups(frame: pd.DataFrame, columns: list[str], missing: str = "drop") -> dict:
+def _groups(frame: pd.DataFrame, columns: list[str], missing: str = "drop",
+            normalizers: list | None = None) -> dict:
     groups = {}
-    for i, key in enumerate(_keys(frame, columns)):
+    for i, key in enumerate(_keys(frame, columns, normalizers)):
         if missing == "match" or all(key):
             groups.setdefault(key, []).append(i)
     return groups
@@ -114,16 +129,53 @@ def _positive_int(value: object, label: str) -> None:
 
 def _pass_fields(columns: tuple, name: str | None, kind: str) -> tuple[list, str]:
     for item in columns:
+        if isinstance(item, Field):
+            continue
         if isinstance(item, (tuple, list)) and any(c is None for c in item):
             raise ValueError(f"`{kind}` compares a left column with a right column, so it cannot use the "
                              f"one-sided field {tuple(item)!r}; one-sided fields are only shown to the judge")
-    fields = parse_on(columns)
+    specs = parse_fields(columns)
+    if any(f.left is None or f.right is None for f in specs):
+        raise ValueError(f"`{kind}` compares a left column with a right column, so it cannot use a "
+                         "one-sided field; one-sided fields are only shown to the judge")
+    fields = [f.triple for f in specs]
+    normalizers = [f.normalize for f in specs]
     if name is None:
         names = [a if a == b else f"{a}={b}" for _, a, b in fields]
         name = f"{kind}:{','.join(names)}"
     if not isinstance(name, str) or not name.strip():
         raise ValueError("a blocker's `name` must be a nonempty string")
-    return fields, name
+    return _PassFields(fields, normalizers), name
+
+
+@dataclass(frozen=True)
+class _PassFields:
+    """The paired columns a pass compares, with each field's own normalizer carried alongside."""
+
+    triples: list
+    normalizers: list
+
+    def __iter__(self):
+        """Iterate the (label, left, right) triples, so existing unpacking keeps working."""
+        return iter(self.triples)
+
+    def __len__(self):
+        return len(self.triples)
+
+    def __getitem__(self, index):
+        return self.triples[index]
+
+    def columns(self, side: int) -> list[str]:
+        return [f[side] for f in self.triples]
+
+    def normalizers_for(self, side: int) -> list:
+        """Only the normalizers of the fields present on that side, in order."""
+        return [n for f, n in zip(self.triples, self.normalizers) if f[side] is not None]
+
+    def specs(self) -> list:
+        """The fields as :class:`Field` objects, their own normalizers restored."""
+        return [Field(label, left, right, normalize=n)
+                for (label, left, right), n in zip(self.triples, self.normalizers)]
 
 
 def _columns(left: pd.DataFrame, right: pd.DataFrame, fields: list) -> tuple[list[str], list[str]]:
@@ -134,6 +186,13 @@ def _columns(left: pd.DataFrame, right: pd.DataFrame, fields: list) -> tuple[lis
     check_columns(left, a, "left")
     check_columns(right, b, "right")
     return a, b
+
+
+def _pass_normalizers(fields, side: int) -> list:
+    """Per-column normalizers for a pass's fields, or None where the default applies."""
+    if isinstance(fields, _PassFields):
+        return fields.normalizers_for(side)
+    return [None] * sum(1 for f in fields if f[side] is not None)
 
 
 def _empty_pairs() -> np.ndarray:
@@ -171,9 +230,10 @@ class _Exact(_StreamingBlocker):
 
     def iter_pairs(self, left: pd.DataFrame, right: pd.DataFrame) -> Iterator[np.ndarray]:
         a, b = _columns(left, right, self.fields)
-        groups = _groups(right, b)
-        yield from _pack_rows((i, groups.get(key, ())) for i, key in enumerate(_keys(left, a))
-                              if all(key))
+        an, bn = _pass_normalizers(self.fields, 1), _pass_normalizers(self.fields, 2)
+        groups = _groups(right, b, normalizers=bn)
+        yield from _pack_rows((i, groups.get(key, ()))
+                              for i, key in enumerate(_keys(left, a, an)) if all(key))
 
 
 def within(blocker: Blocker, *columns: str | tuple[str, str], missing: str = "drop",
@@ -217,7 +277,8 @@ class _Within(_StreamingBlocker):
     def iter_pairs(self, left: pd.DataFrame, right: pd.DataFrame) -> Iterator[np.ndarray]:
         self._validate(left, right)
         a, b = _columns(left, right, self.fields)
-        left_groups, right_groups = _groups(left, a, self.missing), _groups(right, b, self.missing)
+        left_groups = _groups(left, a, self.missing, _pass_normalizers(self.fields, 1))
+        right_groups = _groups(right, b, self.missing, _pass_normalizers(self.fields, 2))
         for key, left_positions in left_groups.items():
             if key not in right_groups:
                 continue
@@ -251,8 +312,8 @@ def ngrams(*columns: str | tuple[str, str], k: int = 10, n: tuple[int, int] = (2
 
 
 def _vectors(left: pd.DataFrame, right: pd.DataFrame, a: list[str], b: list[str],
-             n: tuple[int, int]) -> tuple[csr_matrix, csr_matrix]:
-    text = pd.concat([record_text(left, a), record_text(right, b)], ignore_index=True)
+             n: tuple[int, int], an: list | None = None, bn: list | None = None) -> tuple[csr_matrix, csr_matrix]:
+    text = pd.concat([record_text(left, a, an), record_text(right, b, bn)], ignore_index=True)
     vectorizer = TfidfVectorizer(analyzer="char_wb", ngram_range=n, norm="l2", dtype=np.float64)
     try:
         matrix = vectorizer.fit_transform(text).tocsr()
@@ -303,7 +364,8 @@ class _Ngrams(_StreamingBlocker):
         a, b = _columns(left, right, self.fields)
         if left.empty or right.empty:
             return
-        x, y = _vectors(left, right, a, b, self.n)
+        x, y = _vectors(left, right, a, b, self.n,
+                        _pass_normalizers(self.fields, 1), _pass_normalizers(self.fields, 2))
         if self.reverse:
             x, y = y, x
         for pairs in _pack_rows(self._neighbors(x, y)):
@@ -586,8 +648,8 @@ def _checked_batches(blocker: Blocker, left: pd.DataFrame,
 
 
 def _pair_similarities(left: pd.DataFrame, right: pd.DataFrame, a: list[str], b: list[str],
-                       pairs: np.ndarray) -> np.ndarray:
-    x, y = _vectors(left, right, a, b, _SIM_NGRAMS)
+                       pairs: np.ndarray, an: list | None = None, bn: list | None = None) -> np.ndarray:
+    x, y = _vectors(left, right, a, b, _SIM_NGRAMS, an, bn)
     similarities = np.empty(len(pairs), dtype=np.float64)
     for start in range(0, len(pairs), _PAIR_CHUNK_ROWS):
         chunk = pairs[start:start + _PAIR_CHUNK_ROWS]
@@ -608,11 +670,12 @@ def candidates(left: pd.DataFrame, right: pd.DataFrame, *, on: str | list[str | 
     ``sim``. The default passes search the paired fields only; see ``default_passes``.
     """
     try:
-        fields = parse_on(on, unpaired=True)
+        specs = parse_fields(on, unpaired=True)
     except TypeError as error:
         raise ValueError("`on` must list column names or (left, right) pairs of column names") from error
-    paired = [f for f in fields if f[1] is not None and f[2] is not None]
-    _columns(left, right, paired)
+    fields = [s.triple for s in specs]
+    paired = [s for s in specs if s.left is not None and s.right is not None]
+    _columns(left, right, [s.triple for s in paired])
     a, b = [c for _, c in side_fields(fields, "left")], [c for _, c in side_fields(fields, "right")]
     check_columns(left, a, "left")
     check_columns(right, b, "right")
@@ -623,7 +686,9 @@ def candidates(left: pd.DataFrame, right: pd.DataFrame, *, on: str | list[str | 
             raise ValueError("the default n-gram passes need an `on` field that both sides have; every field "
                              "here is one-sided, so choose the passes yourself with `blockers=`")
         blockers = default_passes(paired)
-    return _union(left, right, blockers, a, b, left_ids, right_ids, max_pairs)
+    return _union(left, right, blockers, a, b, left_ids, right_ids, max_pairs,
+                  left_normalizers=[s.normalize for s in specs if s.left is not None],
+                  right_normalizers=[s.normalize for s in specs if s.right is not None])
 
 
 def default_passes(fields: list) -> list[Blocker]:
@@ -632,10 +697,14 @@ def default_passes(fields: list) -> list[Blocker]:
     The forward pass keeps each left record's 10 nearest right records, the reverse pass each right
     record's 10 nearest left records. A right record that is not among any left record's ten
     nearest, because a crowd of similar names outranks it, is still proposed from its own side.
-    ``fields`` are ``parse_on`` triples; one-sided fields are skipped.
+    ``fields`` may be :class:`Field` specs, so each field's own normalizer reaches the passes; a
+    field compared ``exact``/``number``/``date`` is keyed exactly rather than by n-grams.
     """
-    columns = [(lc, rc) for _, lc, rc in fields if lc is not None and rc is not None]
-    return [ngrams(*columns, k=10), ngrams(*columns, k=10, reverse=True)]
+    specs = parse_fields(fields)
+    text = [s for s in specs if s.compare == "text"]
+    keyed = [s for s in specs if s.compare != "text"]
+    passes = [ngrams(*text, k=10), ngrams(*text, k=10, reverse=True)] if text else []
+    return passes + ([exact(*keyed)] if keyed else [])
 
 
 def _check_limit(max_pairs: object) -> None:
@@ -646,7 +715,8 @@ def _check_limit(max_pairs: object) -> None:
 
 def _union(left: pd.DataFrame, right: pd.DataFrame, blockers: list, a: list[str], b: list[str],
            left_ids: pd.Index, right_ids: pd.Index, max_pairs: int | None, *,
-           unordered: bool = False) -> pd.DataFrame:
+           unordered: bool = False, left_normalizers: list | None = None,
+           right_normalizers: list | None = None) -> pd.DataFrame:
     """Run the passes, union their pairs under the limit, score `sim`, and map positions to IDs.
 
     ``unordered=True`` is for one table paired with itself: a record is never paired with
@@ -703,7 +773,8 @@ def _union(left: pd.DataFrame, right: pd.DataFrame, blockers: list, a: list[str]
               for mask in set(union.values())}
     blocks = [labels[mask] for mask in union.values()]
     del union
-    sim = _pair_similarities(left, right, a, b, pairs) if len(pairs) else np.empty(0, dtype=float)
+    sim = (_pair_similarities(left, right, a, b, pairs, left_normalizers, right_normalizers)
+           if len(pairs) else np.empty(0, dtype=float))
     order = np.lexsort((pairs[:, 1], -sim, pairs[:, 0]))
     result = pd.DataFrame({
         "left_id": left_ids.take(pairs[:, 0]),
