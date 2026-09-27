@@ -20,7 +20,7 @@ from jevkit_runtime import Budget, Meter, Settings
 from jevkit_runtime import resolve as resolve_backend
 
 from .core import PROVIDERS
-from .fields import ids, parse_on
+from .fields import ids, parse_fields, parse_on
 from .judge import EXACT_POLICY, judge, pair_tokens, question, validate_budget, validate_question
 from .provenance import blocker_config, frame_fingerprint, input_fingerprints
 from .resolve import resolve
@@ -167,10 +167,15 @@ class Linker:
         # Quote the question judge() sent. Rebuilding it here is only a fallback for a replaced judge.
         asked = scores.attrs.get("question") or question(
             self.entity or "", self.definition, style=self.style).text
+        # A run is only reproducible if the field contract goes with it: a custom normalizer
+        # changes which pairs are equal, so record whether any field carried one. Both keys are
+        # additive -- `on` keeps its exact shape and `normalization` keeps its base value.
+        field_specs = parse_fields(self.on, unpaired=True)
         settings = {
             "jlink": __version__, "date": date.today().isoformat(), "entity": self.entity,
             "definition": self.definition, "question": asked,
             "on": [[lc, rc] for _, lc, rc in self.fields], **specific,
+            "fields": [spec.to_config() for spec in field_specs],
             "blockers": [b.name for b in passes], "blocker_configs": configs,
             "budget": _limit(budget), "model": meter.model,
             "calls": meter.calls, "cached": meter.cached, "input_tokens": meter.input_tokens,
@@ -182,7 +187,7 @@ class Linker:
             "resolved_models": meter.resolved_models, "unknown_model_answers": meter.unknown_model_answers,
             "answer_provenance": meter.answer_provenance,
             "exact_shortcut": self.exact_shortcut, "exact_policy": EXACT_POLICY,
-            "normalization": "jlink.fields.normalize_v1", "concurrency": int(self.concurrency),
+            "normalization": _normalization_summary(field_specs), "concurrency": int(self.concurrency),
             "cache_enabled": bool(self.cache), "max_pairs": None if max_pairs is None else int(max_pairs),
             "budget_policy": "stop_new_requests_at_observed_cost_v1",
             "cost_sources": meter.cost_sources, "estimated_price_per_million_tokens": Settings.from_env().list_price,
@@ -626,6 +631,13 @@ class DedupeResult:
             raise ValueError("the table's IDs differ from the saved clusters, in value or in order; "
                              "pass the table that was deduplicated")
         return frame
+
+
+def _normalization_summary(field_specs: list) -> str:
+    """The normalizers in play: the base rule, plus the fields that used their own."""
+    custom = [spec.label for spec in field_specs if spec.normalize is not None]
+    base = "jlink.fields.normalize_v1"
+    return base if not custom else f"{base}+custom:{','.join(custom)}"
 
 
 def load(directory: str | Path) -> "Result | DedupeResult":

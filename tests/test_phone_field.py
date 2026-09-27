@@ -142,3 +142,26 @@ def test_judge_reports_what_it_was_given(tables):
     fields = parse_fields([Field("phone", "phone", "phone", normalize=main10)], unpaired=True)
     a = _records(left, pd.Index(left.left_id), _side_specs(fields, "left"))
     assert a.loc["p1", "record"] == {"phone": "(555) 123-4567"}
+
+
+def test_settings_record_the_field_contract_without_breaking_old_keys(tables):
+    """A saved run must say it used a custom normalizer, and keep `on` shaped as before."""
+    from jlink.linker import _normalization_summary
+    from jlink.fields import parse_fields
+
+    specs = parse_fields([("name", "name"), Field("phone", "phone", "phone", normalize=main10)])
+    summary = _normalization_summary(specs)
+    assert summary == "jlink.fields.normalize_v1+custom:phone"
+
+    # the base value is unchanged when no field carries its own rule
+    assert _normalization_summary(parse_fields([("name", "name")])) == "jlink.fields.normalize_v1"
+
+
+def test_field_config_is_json_serializable_for_provenance():
+    import json
+    from jlink.fields import parse_fields
+    config = [f.to_config() for f in parse_fields(
+        [("name", "name"), Field("phone", "phone", "phone", normalize=main10, compare="exact", judge=False)])]
+    json.dumps(config)   # a callable must never reach settings.json
+    assert config[1] == {"label": "phone", "left": "phone", "right": "phone",
+                         "compare": "exact", "judge": False, "custom_normalizer": True}
