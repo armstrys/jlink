@@ -15,7 +15,8 @@ import pandas as pd
 from scipy.sparse import csr_matrix
 from sklearn.feature_extraction.text import TfidfVectorizer
 
-from .fields import check_columns, ids, key_text, normalize, parse_on, record_text, side_fields
+from .fields import (Field, check_columns, ids, key_text, normalize, parse_fields, parse_on,
+                     record_text, side_fields)
 
 # Bound even a fully populated sparse product to about 64 MiB (float64 + int32).
 _CHUNK_ROWS = 256
@@ -127,16 +128,48 @@ def _positive_int(value: object, label: str) -> None:
 
 def _pass_fields(columns: tuple, name: str | None, kind: str) -> tuple[list, str]:
     for item in columns:
+        if isinstance(item, Field):
+            continue
         if isinstance(item, (tuple, list)) and any(c is None for c in item):
             raise ValueError(f"`{kind}` compares a left column with a right column, so it cannot use the "
                              f"one-sided field {tuple(item)!r}; one-sided fields are only shown to the judge")
-    fields = parse_on(columns)
+    specs = parse_fields(columns)
+    if any(f.left is None or f.right is None for f in specs):
+        raise ValueError(f"`{kind}` compares a left column with a right column, so it cannot use a "
+                         "one-sided field; one-sided fields are only shown to the judge")
+    fields = [f.triple for f in specs]
+    normalizers = [f.normalize for f in specs]
     if name is None:
         names = [a if a == b else f"{a}={b}" for _, a, b in fields]
         name = f"{kind}:{','.join(names)}"
     if not isinstance(name, str) or not name.strip():
         raise ValueError("a blocker's `name` must be a nonempty string")
-    return fields, name
+    return _PassFields(fields, normalizers), name
+
+
+@dataclass(frozen=True)
+class _PassFields:
+    """The paired columns a pass compares, with each field's own normalizer carried alongside."""
+
+    triples: list
+    normalizers: list
+
+    def __iter__(self):
+        """Iterate the (label, left, right) triples, so existing unpacking keeps working."""
+        return iter(self.triples)
+
+    def __len__(self):
+        return len(self.triples)
+
+    def __getitem__(self, index):
+        return self.triples[index]
+
+    def columns(self, side: int) -> list[str]:
+        return [f[side] for f in self.triples]
+
+    def normalizers_for(self, side: int) -> list:
+        """Only the normalizers of the fields present on that side, in order."""
+        return [n for f, n in zip(self.triples, self.normalizers) if f[side] is not None]
 
 
 def _columns(left: pd.DataFrame, right: pd.DataFrame, fields: list) -> tuple[list[str], list[str]]:
@@ -147,6 +180,13 @@ def _columns(left: pd.DataFrame, right: pd.DataFrame, fields: list) -> tuple[lis
     check_columns(left, a, "left")
     check_columns(right, b, "right")
     return a, b
+
+
+def _pass_normalizers(fields, side: int) -> list:
+    """Per-column normalizers for a pass's fields, or None where the default applies."""
+    if isinstance(fields, _PassFields):
+        return fields.normalizers_for(side)
+    return [None] * sum(1 for f in fields if f[side] is not None)
 
 
 def _empty_pairs() -> np.ndarray:
@@ -184,9 +224,10 @@ class _Exact(_StreamingBlocker):
 
     def iter_pairs(self, left: pd.DataFrame, right: pd.DataFrame) -> Iterator[np.ndarray]:
         a, b = _columns(left, right, self.fields)
-        groups = _groups(right, b)
-        yield from _pack_rows((i, groups.get(key, ())) for i, key in enumerate(_keys(left, a))
-                              if all(key))
+        an, bn = _pass_normalizers(self.fields, 1), _pass_normalizers(self.fields, 2)
+        groups = _groups(right, b, normalizers=bn)
+        yield from _pack_rows((i, groups.get(key, ()))
+                              for i, key in enumerate(_keys(left, a, an)) if all(key))
 
 
 def within(blocker: Blocker, *columns: str | tuple[str, str], missing: str = "drop",
